@@ -1,0 +1,30 @@
+[package]
+name = "intersession-layer-messaging"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Thomas Braun"]
+description = "A metastable messenger that allows reliability between peers when peers go offline, are unreliable, and facing intermittent network conditions between sessions"
+homepage = "https://avarok.net"
+repository = "https://github.com/tbraun96/intersession-layer-messaging"
+readme = "README.md"
+keywords = ["messaging", "networking", "reliability", "intermittent", "peer"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+testing = []
+
+[dependencies]
+citadel_logging = "0.8.0"
+serde = { version = "1.0.104", features = ["derive"] }
+bincode2 = { version = "2.0.1", default-features = false }
+uuid = { version = "1.8.0", features = ["v4"] }
+tokio = { version = "1.28.1", features = ["sync", "rt",  "time"] }
+log = "0.4.21"
+futures = { version = "0.3.28", features = ["alloc"] }
+async-trait = { version = "0.1.83" }
+itertools = { version = "0.13.0" }
+dashmap = { version = "6.1.0", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
