@@ -60,19 +60,52 @@ impl MessageMetadata for MyMessage {
     }
 }
 
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create your message system
-    let backend = MyBackend::new();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let network = MyNetwork::new();
+#[tokio::main]
+async fn main() {
+    let network = InMemoryNetwork::<TestMessage>::new();
+    let network1 = network.add_peer(1).await;
+    let network2 = network.add_peer(2).await;
 
-    let messenger = MessageSystem::new(backend, tx, network);
-    messenger.send_to(2, b"Hello, world!").await?;
+    let backend1 = InMemoryBackend::<TestMessage>::default();
+    let backend2 = InMemoryBackend::<TestMessage>::default();
 
-    // Graceful shutdown
-    messenger.shutdown(Duration::from_secs(5)).await?;
+    let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+    let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-    Ok(())
+    let message_system1 = MessageSystem::new(backend1, tx1, network1).await.unwrap();
+    let message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+
+    // Peer 1 sends a message to Peer 2
+    let message1 = TestMessage {
+        source_id: 1,
+        destination_id: 2,
+        message_id: 1,
+        contents: vec![1, 2, 3],
+    };
+    
+    message_system1.send_raw_message(message1).await.unwrap();
+
+    // Peer 2 sends a message to Peer 1
+    let message2 = TestMessage {
+        source_id: 2,
+        destination_id: 1,
+        message_id: 2,
+        contents: vec![4, 5, 6],
+    };
+    
+    message_system2.send_raw_message(message2).await.unwrap();
+
+    // Peer 1 receives the message from Peer 2
+    let received_message1 = rx1.recv().await.unwrap();
+    assert_eq!(received_message1.source_id(), 2);
+    assert_eq!(received_message1.destination_id(), 1);
+    assert_eq!(received_message1.contents(), &[4, 5, 6]);
+
+    // Peer 2 receives the message from Peer 1
+    let received_message2 = rx2.recv().await.unwrap();
+    assert_eq!(received_message2.source_id(), 1);
+    assert_eq!(received_message2.destination_id(), 2);
+    assert_eq!(received_message2.contents(), &[1, 2, 3]);
 }
 ```
 

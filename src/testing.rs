@@ -275,9 +275,9 @@ impl MessageMetadata for TestMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
-    use crate::MessageSystem;
+    use crate::{Backend, BackendError, MessageMetadata, MessageSystem, NetworkError, Payload};
+    use async_trait::async_trait;
     use citadel_logging::setup_log;
     use futures::stream::FuturesOrdered;
     use futures::StreamExt;
@@ -286,6 +286,52 @@ mod tests {
     use std::pin::Pin;
     use std::time::Duration;
     use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn test_two_peers_send_receive() {
+        let network = InMemoryNetwork::<TestMessage>::new();
+        let network1 = network.add_peer(1).await;
+        let network2 = network.add_peer(2).await;
+
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+
+        let message_system1 = MessageSystem::new(backend1, tx1, network1).await.unwrap();
+        let message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+
+        // Peer 1 sends a message to Peer 2
+        let message1 = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 1,
+            contents: vec![1, 2, 3],
+        };
+        message_system1.send_raw_message(message1).await.unwrap();
+
+        // Peer 2 sends a message to Peer 1
+        let message2 = TestMessage {
+            source_id: 2,
+            destination_id: 1,
+            message_id: 2,
+            contents: vec![4, 5, 6],
+        };
+        message_system2.send_raw_message(message2).await.unwrap();
+
+        // Peer 1 receives the message from Peer 2
+        let received_message1 = rx1.recv().await.unwrap();
+        assert_eq!(received_message1.source_id(), 2);
+        assert_eq!(received_message1.destination_id(), 1);
+        assert_eq!(received_message1.contents(), &[4, 5, 6]);
+
+        // Peer 2 receives the message from Peer 1
+        let received_message2 = rx2.recv().await.unwrap();
+        assert_eq!(received_message2.source_id(), 1);
+        assert_eq!(received_message2.destination_id(), 2);
+        assert_eq!(received_message2.contents(), &[1, 2, 3]);
+    }
 
     #[tokio::test]
     async fn test_message_system_basic() {

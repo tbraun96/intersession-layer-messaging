@@ -1,6 +1,6 @@
 [package]
 name = "intersession-layer-messaging"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Thomas Braun"]
@@ -27,4 +27,4 @@ itertools = { version = "0.13.0" }
 dashmap = { version = "6.1.0", features = ["serde"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { version = "1.28.1", features = ["rt-multi-thread"] }
