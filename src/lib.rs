@@ -5,12 +5,13 @@ use futures::StreamExt;
 use itertools::Itertools;
 use local_delivery::LocalDelivery;
 use message_tracker::MessageTracker;
+use num::traits::NumOps;
+use num::Num;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::ops::Add;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -28,7 +29,6 @@ const INBOUND_POLL: Duration = Duration::from_millis(200);
 #[async_trait]
 pub trait MessageMetadata: Debug + Send + Sync + 'static {
     type PeerId: Default
-        + Add<usize, Output = Self::MessageId>
         + Display
         + Debug
         + Hash
@@ -40,7 +40,8 @@ pub trait MessageMetadata: Debug + Send + Sync + 'static {
         + Send
         + Sync
         + 'static;
-    type MessageId: Add<usize, Output = Self::MessageId>
+    type MessageId: Num
+        + NumOps
         + Eq
         + Default
         + PartialEq
@@ -56,15 +57,17 @@ pub trait MessageMetadata: Debug + Send + Sync + 'static {
         + Sync
         + 'static;
 
+    type Contents: Send + Sync + 'static;
+
     fn source_id(&self) -> Self::PeerId;
     fn destination_id(&self) -> Self::PeerId;
     fn message_id(&self) -> Self::MessageId;
-    fn contents(&self) -> &[u8];
+    fn contents(&self) -> &Self::Contents;
     fn construct_from_parts(
         source_id: Self::PeerId,
         destination_id: Self::PeerId,
         message_id: Self::MessageId,
-        contents: impl Into<Vec<u8>>,
+        contents: impl Into<Self::Contents>,
     ) -> Self;
 }
 
@@ -73,9 +76,12 @@ pub trait UnderlyingSessionTransport {
     type Message: MessageMetadata + Send + Sync + 'static;
 
     async fn next_message(&self) -> Option<Payload<Self::Message>>;
-    async fn send_message(&self, message: Payload<Self::Message>) -> Result<(), NetworkError>;
+    async fn send_message(
+        &self,
+        message: Payload<Self::Message>,
+    ) -> Result<(), NetworkError<Payload<Self::Message>>>;
     async fn connected_peers(&self) -> Vec<<Self::Message as MessageMetadata>::PeerId>;
-    fn peer_id(&self) -> <Self::Message as MessageMetadata>::PeerId;
+    fn local_id(&self) -> <Self::Message as MessageMetadata>::PeerId;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,17 +99,18 @@ pub enum Payload<M: MessageMetadata> {
 }
 
 #[derive(Debug)]
-pub enum NetworkError {
-    SendFailed(String),
+pub enum NetworkError<T> {
+    SendFailed { reason: String, message: T },
     ConnectionError(String),
-    BackendError(BackendError),
+    BackendError(BackendError<T>),
     ShutdownFailed(String),
     SystemShutdown,
 }
 
 #[derive(Debug)]
-pub enum BackendError {
+pub enum BackendError<T> {
     StorageError(String),
+    SendFailed { reason: String, message: T },
     NotFound,
 }
 
@@ -111,33 +118,35 @@ pub enum BackendError {
 pub enum DeliveryError {
     NoReceiver,
     ChannelClosed,
+    BadInput,
 }
 
 // Modified Backend trait to handle both outbound and inbound messages
 #[async_trait]
+#[auto_impl::auto_impl(&, Arc, Box)]
 pub trait Backend<M: MessageMetadata> {
-    async fn store_outbound(&self, message: M) -> Result<(), BackendError>;
-    async fn store_inbound(&self, message: M) -> Result<(), BackendError>;
+    async fn store_outbound(&self, message: M) -> Result<(), BackendError<M>>;
+    async fn store_inbound(&self, message: M) -> Result<(), BackendError<M>>;
     async fn clear_message_inbound(
         &self,
         peer_id: M::PeerId,
         message_id: M::MessageId,
-    ) -> Result<(), BackendError>;
+    ) -> Result<(), BackendError<M>>;
     async fn clear_message_outbound(
         &self,
         peer_id: M::PeerId,
         message_id: M::MessageId,
-    ) -> Result<(), BackendError>;
-    async fn get_pending_outbound(&self) -> Result<Vec<M>, BackendError>;
-    async fn get_pending_inbound(&self) -> Result<Vec<M>, BackendError>;
+    ) -> Result<(), BackendError<M>>;
+    async fn get_pending_outbound(&self) -> Result<Vec<M>, BackendError<M>>;
+    async fn get_pending_inbound(&self) -> Result<Vec<M>, BackendError<M>>;
     // Simple K/V interface for tracker state
-    async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError>;
-    async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
+    async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>>;
+    async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>>;
 }
 
 const MAX_MAP_SIZE: usize = 1000;
 
-pub struct MessageSystem<M, B, L, N>
+pub struct ILM<M, B, L, N>
 where
     M: MessageMetadata + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
     B: Backend<M> + Send + Sync + 'static,
@@ -154,7 +163,7 @@ where
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
 }
 
-impl<M, B, L, N> Clone for MessageSystem<M, B, L, N>
+impl<M, B, L, N> Clone for ILM<M, B, L, N>
 where
     M: MessageMetadata + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
     B: Backend<M> + Send + Sync + 'static,
@@ -175,7 +184,7 @@ where
     }
 }
 
-impl<M, B, L, N> Drop for MessageSystem<M, B, L, N>
+impl<M, B, L, N> Drop for ILM<M, B, L, N>
 where
     M: MessageMetadata + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
     B: Backend<M> + Send + Sync + 'static,
@@ -187,14 +196,14 @@ where
     }
 }
 
-impl<M, B, L, N> MessageSystem<M, B, L, N>
+impl<M, B, L, N> ILM<M, B, L, N>
 where
     M: MessageMetadata + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
     B: Backend<M> + Send + Sync + 'static,
     L: LocalDelivery<M> + Send + Sync + 'static,
     N: UnderlyingSessionTransport<Message = M> + Send + Sync + 'static,
 {
-    pub async fn new(backend: B, local_delivery: L, network: N) -> Result<Self, BackendError> {
+    pub async fn new(backend: B, local_delivery: L, network: N) -> Result<Self, BackendError<M>> {
         let (poll_inbound_tx, poll_inbound_rx) = tokio::sync::mpsc::unbounded_channel();
         let (poll_outbound_tx, poll_outbound_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -310,7 +319,7 @@ where
                         if let Err(e) = self_clone
                             .network
                             .send_message(Payload::Poll {
-                                from_id: self_clone.network.peer_id(),
+                                from_id: self_clone.network.local_id(),
                                 to_id: *peer_id,
                             })
                             .await
@@ -493,7 +502,7 @@ where
                     message_id,
                     to_id,
                 } => {
-                    if to_id != self.network.peer_id() {
+                    if to_id != self.network.local_id() {
                         log::warn!(target: "ism", "Received ACK for another peer");
                         return;
                     }
@@ -518,7 +527,7 @@ where
                     }
                 }
                 Payload::Message(msg) => {
-                    if msg.destination_id() != self.network.peer_id() {
+                    if msg.destination_id() != self.network.local_id() {
                         log::warn!(target: "ism", "Received message for another peer");
                         return;
                     }
@@ -579,14 +588,14 @@ where
     pub async fn send_to(
         &self,
         to: M::PeerId,
-        contents: impl Into<Vec<u8>>,
-    ) -> Result<(), NetworkError> {
-        let my_id = self.network.peer_id();
+        contents: impl Into<M::Contents>,
+    ) -> Result<(), NetworkError<M>> {
+        let my_id = self.network.local_id();
         let next_id_for_this_peer_conn = self
             .tracker
             .get_next_id(to)
             .await
-            .map_err(NetworkError::BackendError)?;
+            .map_err(|err| NetworkError::BackendError(err))?;
         let message = M::construct_from_parts(my_id, to, next_id_for_this_peer_conn, contents);
         self.send_raw_message(message).await
     }
@@ -595,24 +604,31 @@ where
     /// create messages. In this case, the message ID must be an auto-incremented value to
     /// ensure uniqueness, and the source_id must match the ID of the node sending the message
     /// in the networking layer. Additionally, the source and destination fields cannot be the same
-    pub async fn send_raw_message(&self, message: M) -> Result<(), NetworkError> {
-        if message.source_id() != self.network.peer_id() {
-            return Err(NetworkError::SendFailed(
-                "Source ID does not match network peer ID".into(),
-            ));
+    pub async fn send_raw_message(&self, message: M) -> Result<(), NetworkError<M>> {
+        if message.source_id() != self.network.local_id() {
+            return Err(NetworkError::SendFailed {
+                reason: "Source ID does not match network peer ID".into(),
+                message,
+            });
         }
 
-        if message.destination_id() == self.network.peer_id() {
-            return Err(NetworkError::SendFailed(
-                "Cannot send message to self".into(),
-            ));
+        if message.destination_id() == self.network.local_id() {
+            return Err(NetworkError::SendFailed {
+                reason: "Cannot send message to self".into(),
+                message,
+            });
         }
 
         if self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
             self.backend
                 .store_outbound(message)
                 .await
-                .map_err(NetworkError::BackendError)?;
+                .map_err(|err| match err {
+                    BackendError::SendFailed { reason, message } => {
+                        NetworkError::SendFailed { reason, message }
+                    }
+                    err => NetworkError::BackendError(err),
+                })?;
 
             self.poll_outbound_tx
                 .send(())
@@ -634,7 +650,7 @@ where
 
     /// Shutdown the message system gracefully
     /// This will stop the background tasks and wait for pending outbound messages to be processed
-    pub async fn shutdown(self, timeout: Duration) -> Result<(), NetworkError> {
+    pub async fn shutdown(self, timeout: Duration) -> Result<(), NetworkError<M>> {
         // Wait for pending messages to be processed
         tokio::time::timeout(timeout, async {
             while !self
@@ -646,7 +662,7 @@ where
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Ok::<_, NetworkError>(())
+            Ok::<_, NetworkError<M>>(())
         })
         .await
         .map_err(|err| NetworkError::ShutdownFailed(err.to_string()))??;
@@ -655,6 +671,11 @@ where
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
+    }
+
+    /// Returns the ID of this node in the network
+    pub fn local_id(&self) -> M::PeerId {
+        self.network.local_id()
     }
 
     fn can_run(&self) -> bool {

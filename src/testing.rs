@@ -40,7 +40,7 @@ impl<M: MessageMetadata> Default for InMemoryBackend<M> {
 
 #[async_trait]
 impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemoryBackend<M> {
-    async fn store_outbound(&self, message: M) -> Result<(), BackendError> {
+    async fn store_outbound(&self, message: M) -> Result<(), BackendError<M>> {
         let mut outbound = self.outbound.write().await;
         let (source_id, destination_id, message_id) = (
             message.source_id(),
@@ -61,7 +61,7 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
         Ok(())
     }
 
-    async fn store_inbound(&self, message: M) -> Result<(), BackendError> {
+    async fn store_inbound(&self, message: M) -> Result<(), BackendError<M>> {
         let mut inbound = self.inbound.write().await;
         let (source_id, message_id) = (message.source_id(), message.message_id());
 
@@ -79,7 +79,7 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
         &self,
         peer_id: M::PeerId,
         message_id: M::MessageId,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), BackendError<M>> {
         // Try to remove from both outbound and inbound
         let mut inbound = self.inbound.write().await;
         if inbound.remove(&(peer_id, message_id)).is_none() {
@@ -97,7 +97,7 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
         &self,
         peer_id: M::PeerId,
         message_id: M::MessageId,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), BackendError<M>> {
         let mut outbound = self.outbound.write().await;
         if outbound.remove(&(peer_id, message_id)).is_none() {
             log::warn!(target: "ism",
@@ -110,23 +110,23 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
         Ok(())
     }
 
-    async fn get_pending_outbound(&self) -> Result<Vec<M>, BackendError> {
+    async fn get_pending_outbound(&self) -> Result<Vec<M>, BackendError<M>> {
         let outbound = self.outbound.read().await;
         Ok(outbound.values().cloned().collect())
     }
 
-    async fn get_pending_inbound(&self) -> Result<Vec<M>, BackendError> {
+    async fn get_pending_inbound(&self) -> Result<Vec<M>, BackendError<M>> {
         let inbound = self.inbound.read().await;
         Ok(inbound.values().cloned().collect())
     }
 
-    async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError> {
+    async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>> {
         // Store the bytes to the temp directory + key.bin
         let path = self.random_dir.join(format!("{key}.bin"));
         std::fs::write(path, value).map_err(|err| BackendError::StorageError(err.to_string()))
     }
 
-    async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+    async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>> {
         // Load the bytes from the temp directory + key.bin
         let path = self.random_dir.join(format!("{key}.bin"));
         match std::fs::read(path) {
@@ -188,10 +188,12 @@ impl<M: MessageMetadata> InMemoryNetwork<M> {
         &self,
         id: M::PeerId,
         message: Payload<M>,
-    ) -> Result<(), NetworkError> {
+    ) -> Result<(), NetworkError<Payload<M>>> {
         if let Some(tx) = self.messages.read().await.get(&id) {
-            tx.send(message)
-                .map_err(|_| NetworkError::SendFailed("Failed to send message".into()))
+            tx.send(message).map_err(|err| NetworkError::SendFailed {
+                reason: err.to_string(),
+                message: err.0,
+            })
         } else {
             Err(NetworkError::ConnectionError("Peer not found".into()))
         }
@@ -206,7 +208,10 @@ impl<M: MessageMetadata> UnderlyingSessionTransport for InMemoryNetwork<M> {
         self.my_rx.lock().await.recv().await
     }
 
-    async fn send_message(&self, message: Payload<Self::Message>) -> Result<(), NetworkError> {
+    async fn send_message(
+        &self,
+        message: Payload<Self::Message>,
+    ) -> Result<(), NetworkError<Payload<M>>> {
         match &message {
             Payload::Message(msg) => {
                 let peer_id = msg.destination_id();
@@ -221,7 +226,7 @@ impl<M: MessageMetadata> UnderlyingSessionTransport for InMemoryNetwork<M> {
         self.messages.read().await.keys().cloned().collect()
     }
 
-    fn peer_id(&self) -> <Self::Message as MessageMetadata>::PeerId {
+    fn local_id(&self) -> <Self::Message as MessageMetadata>::PeerId {
         self.my_id
     }
 }
@@ -234,10 +239,10 @@ pub struct TestMessage {
     contents: Vec<u8>,
 }
 
-#[async_trait]
 impl MessageMetadata for TestMessage {
     type PeerId = usize;
     type MessageId = usize;
+    type Contents = Vec<u8>;
 
     fn source_id(&self) -> Self::PeerId {
         self.source_id
@@ -251,7 +256,7 @@ impl MessageMetadata for TestMessage {
         self.message_id
     }
 
-    fn contents(&self) -> &[u8] {
+    fn contents(&self) -> &Self::Contents {
         &self.contents
     }
 
@@ -259,7 +264,7 @@ impl MessageMetadata for TestMessage {
         source_id: Self::PeerId,
         destination_id: Self::PeerId,
         message_id: Self::MessageId,
-        contents: impl Into<Vec<u8>>,
+        contents: impl Into<Self::Contents>,
     ) -> Self
     where
         Self: Sized,
@@ -276,7 +281,7 @@ impl MessageMetadata for TestMessage {
 #[cfg(test)]
 mod tests {
     use crate::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
-    use crate::{Backend, BackendError, MessageMetadata, MessageSystem, NetworkError, Payload};
+    use crate::{Backend, BackendError, MessageMetadata, NetworkError, Payload, ILM};
     use async_trait::async_trait;
     use citadel_logging::setup_log;
     use futures::stream::FuturesOrdered;
@@ -299,8 +304,8 @@ mod tests {
         let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let messenger1 = MessageSystem::new(backend1, tx1, network1).await.unwrap();
-        let messenger2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let messenger1 = ILM::new(backend1, tx1, network1).await.unwrap();
+        let messenger2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         // Peer 1 sends a message to Peer 2
         messenger1.send_to(2, vec![1, 2, 3]).await.unwrap();
@@ -331,9 +336,7 @@ mod tests {
             let network = network.add_peer(this_peer_id).await;
             let backend = InMemoryBackend::<TestMessage>::default();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let message_system = MessageSystem::new(backend, tx, network.clone())
-                .await
-                .unwrap();
+            let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
             let future = async move {
                 let message_contents = vec![1, 2, 3];
@@ -385,9 +388,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend, tx, network.clone())
-            .await
-            .unwrap();
+        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -397,7 +398,7 @@ mod tests {
         };
 
         let result = message_system.send_raw_message(message).await;
-        assert!(matches!(result, Err(NetworkError::SendFailed(_))));
+        assert!(matches!(result, Err(NetworkError::SendFailed { .. })));
     }
 
     #[tokio::test]
@@ -406,9 +407,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend, tx, network.clone())
-            .await
-            .unwrap();
+        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
         let message = TestMessage {
             source_id: 2, // Mismatched source ID
@@ -418,7 +417,7 @@ mod tests {
         };
 
         let result = message_system.send_raw_message(message).await;
-        assert!(matches!(result, Err(NetworkError::SendFailed(_))));
+        assert!(matches!(result, Err(NetworkError::SendFailed { .. })));
     }
 
     #[tokio::test]
@@ -427,7 +426,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -470,10 +469,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend, tx, network.clone())
-            .await
-            .unwrap();
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         let messages = vec![
             TestMessage {
@@ -515,9 +512,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend, tx, network.clone())
-            .await
-            .unwrap();
+        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
         message_system
             .is_running
@@ -543,10 +538,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend, tx, network.clone())
-            .await
-            .unwrap();
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         const NUM_MESSAGES: u8 = 255;
         let mut messages = vec![];
@@ -583,7 +576,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -615,10 +608,10 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         // Send the same message twice
         let message = TestMessage {
@@ -656,7 +649,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -689,7 +682,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -728,12 +721,8 @@ mod tests {
         let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = MessageSystem::new(backend1, tx1, network.clone())
-            .await
-            .unwrap();
-        let message_system2 = MessageSystem::new(backend2, tx2, network2.clone())
-            .await
-            .unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
+        let message_system2 = ILM::new(backend2, tx2, network2.clone()).await.unwrap();
 
         // Peer 1 sends to Peer 2
         let message1 = TestMessage {
@@ -793,12 +782,8 @@ mod tests {
         let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = MessageSystem::new(backend1, tx1, network.clone())
-            .await
-            .unwrap();
-        let message_system2 = MessageSystem::new(backend2, tx2, network2.clone())
-            .await
-            .unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
+        let message_system2 = ILM::new(backend2, tx2, network2.clone()).await.unwrap();
 
         const NUM_MESSAGES: u8 = 255;
 
@@ -884,7 +869,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -929,10 +914,8 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = MessageSystem::new(backend1, tx1, network.clone())
-            .await
-            .unwrap();
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -955,7 +938,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -993,10 +976,8 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = MessageSystem::new(backend1, tx1, network.clone())
-            .await
-            .unwrap();
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -1019,30 +1000,52 @@ mod tests {
 
         #[async_trait]
         impl Backend<TestMessage> for FailingBackend {
-            async fn store_outbound(&self, _: TestMessage) -> Result<(), BackendError> {
+            async fn store_outbound(
+                &self,
+                _: TestMessage,
+            ) -> Result<(), BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
-            async fn store_inbound(&self, _: TestMessage) -> Result<(), BackendError> {
+            async fn store_inbound(&self, _: TestMessage) -> Result<(), BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
-            async fn clear_message_inbound(&self, _: usize, _: usize) -> Result<(), BackendError> {
+            async fn clear_message_inbound(
+                &self,
+                _: usize,
+                _: usize,
+            ) -> Result<(), BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
-            async fn clear_message_outbound(&self, _: usize, _: usize) -> Result<(), BackendError> {
+            async fn clear_message_outbound(
+                &self,
+                _: usize,
+                _: usize,
+            ) -> Result<(), BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
-            async fn get_pending_outbound(&self) -> Result<Vec<TestMessage>, BackendError> {
+            async fn get_pending_outbound(
+                &self,
+            ) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
-            async fn get_pending_inbound(&self) -> Result<Vec<TestMessage>, BackendError> {
+            async fn get_pending_inbound(
+                &self,
+            ) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
 
-            async fn store_value(&self, _key: &str, _value: &[u8]) -> Result<(), BackendError> {
+            async fn store_value(
+                &self,
+                _key: &str,
+                _value: &[u8],
+            ) -> Result<(), BackendError<TestMessage>> {
                 Ok(())
             }
 
-            async fn load_value(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            async fn load_value(
+                &self,
+                _key: &str,
+            ) -> Result<Option<Vec<u8>>, BackendError<TestMessage>> {
                 Ok(None)
             }
         }
@@ -1050,9 +1053,7 @@ mod tests {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(FailingBackend, tx, network.clone())
-            .await
-            .unwrap();
+        let message_system = ILM::new(FailingBackend, tx, network.clone()).await.unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -1076,7 +1077,7 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
             .await
             .unwrap();
 
@@ -1097,7 +1098,7 @@ mod tests {
 
         // Now create peer 2's message system - this should trigger the peer polling mechanism
         let network2 = network.add_peer(2).await;
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         // Should receive all messages in order due to polling
         for i in 0..3 {
@@ -1121,10 +1122,10 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
             .await
             .unwrap();
-        let _message_system2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
         // Send some messages
         for i in 0..3 {
@@ -1161,7 +1162,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = MessageSystem::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
             .unwrap();
 
@@ -1194,10 +1195,10 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
-            let _message_system2 = MessageSystem::new(backend2.clone(), tx2, network2.clone())
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
                 .await
                 .unwrap();
 
@@ -1224,10 +1225,10 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
-            let _message_system2 = MessageSystem::new(backend2.clone(), tx2, network2.clone())
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
                 .await
                 .unwrap();
 
@@ -1258,10 +1259,10 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
-            let _message_system2 = MessageSystem::new(backend2.clone(), tx2, network2.clone())
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
                 .await
                 .unwrap();
 
@@ -1279,10 +1280,10 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let _message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
-            let _message_system2 = MessageSystem::new(backend2.clone(), tx2, network2.clone())
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
                 .await
                 .unwrap();
 
@@ -1306,10 +1307,10 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
-            let _message_system2 = MessageSystem::new(backend2.clone(), tx2, network2.clone())
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
                 .await
                 .unwrap();
 
@@ -1329,10 +1330,10 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let _message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
-            let _message_system2 = MessageSystem::new(backend2.clone(), tx2, network2.clone())
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
                 .await
                 .unwrap();
 
@@ -1368,7 +1369,7 @@ mod tests {
         // First session - send messages to multiple peers
         {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
 
@@ -1387,7 +1388,7 @@ mod tests {
         // Second session - verify state for both peers
         {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let _message_system1 = MessageSystem::new(backend1.clone(), tx1, network.clone())
+            let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
 

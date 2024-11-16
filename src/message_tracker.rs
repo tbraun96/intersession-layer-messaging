@@ -1,5 +1,6 @@
 use crate::{Backend, BackendError, MessageMetadata, MAX_MAP_SIZE};
 use dashmap::{DashMap, DashSet};
+use num::One;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -17,7 +18,7 @@ where
     M: MessageMetadata,
     B: Backend<M>,
 {
-    pub async fn new(backend: Arc<B>) -> Result<Self, BackendError> {
+    pub async fn new(backend: Arc<B>) -> Result<Self, BackendError<M>> {
         let mut tracker = Self {
             last_acked: Default::default(),
             last_sent: Default::default(),
@@ -59,7 +60,7 @@ where
         &self,
         peer_id: M::PeerId,
         msg_id: M::MessageId,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), BackendError<M>> {
         self.last_acked.insert(peer_id, msg_id);
         self.backend
             .store_value(
@@ -73,17 +74,17 @@ where
         &self,
         peer_id: M::PeerId,
         msg_id: M::MessageId,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), BackendError<M>> {
         self.last_sent.insert(peer_id, msg_id);
         self.backend
             .store_value("last_sent", &bincode2::serialize(&self.last_sent).unwrap())
             .await
     }
 
-    pub async fn get_next_id(&self, peer_id: M::PeerId) -> Result<M::MessageId, BackendError> {
+    pub async fn get_next_id(&self, peer_id: M::PeerId) -> Result<M::MessageId, BackendError<M>> {
         let mut entry = self.next_unique_id.entry(peer_id).or_default();
         let current = *entry;
-        *entry = current + 1;
+        *entry = current + M::MessageId::one();
         drop(entry);
         self.backend
             .store_value(
@@ -110,7 +111,7 @@ where
         &self,
         peer_id: M::PeerId,
         msg_id: M::MessageId,
-    ) -> Result<bool, BackendError> {
+    ) -> Result<bool, BackendError<M>> {
         if self.received_messages.contains_key(&(peer_id, msg_id)) {
             return Ok(false);
         }
@@ -143,7 +144,7 @@ where
     }
 
     // Sync all states to the backend
-    pub async fn sync_backend(&self) -> Result<(), BackendError> {
+    pub async fn sync_backend(&self) -> Result<(), BackendError<M>> {
         self.backend
             .store_value(
                 "last_acked",

@@ -27,7 +27,7 @@ Below is an example of using the `TestMessage` type, which already implements `M
 ### Basic Example
 
 ```rust
-use intersession_layer_messaging::{MessageSystem, MessageMetadata, Network, Backend, LocalDelivery, testing::*};
+use intersession_layer_messaging::{ILM, MessageMetadata, Network, Backend, LocalDelivery, testing::*};
 
 #[tokio::main]
 async fn main() {
@@ -41,8 +41,8 @@ async fn main() {
     let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
     let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-    let messenger1 = MessageSystem::new(backend1, tx1, network1).await.unwrap();
-    let messenger2 = MessageSystem::new(backend2, tx2, network2).await.unwrap();
+    let messenger1 = ILM::new(backend1, tx1, network1).await.unwrap();
+    let messenger2 = ILM::new(backend2, tx2, network2).await.unwrap();
 
     // Peer 1 sends a message to Peer 2
     messenger1.send_to(2, vec![1, 2, 3]).await.unwrap();

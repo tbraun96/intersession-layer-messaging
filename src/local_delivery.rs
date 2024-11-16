@@ -1,7 +1,9 @@
 use crate::{DeliveryError, MessageMetadata};
 use async_trait::async_trait;
+use auto_impl::auto_impl;
 
 #[async_trait]
+#[auto_impl(Box, Arc)]
 pub trait LocalDelivery<M: MessageMetadata> {
     async fn deliver(&self, message: M) -> Result<(), DeliveryError>;
 }
