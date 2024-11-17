@@ -1,6 +1,6 @@
 [package]
 name = "intersession-layer-messaging"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Thomas Braun"]
@@ -15,18 +15,18 @@ categories = ["network-programming", "asynchronous"]
 testing = []
 
 [dependencies]
-citadel_logging = "0.8.0"
-serde = { version = "1.0.104", features = ["derive"] }
+citadel_logging = { version = "0.8.0", default-features = false }
+serde = { version = "1.0.104", default-features = false, features = ["derive"] }
 bincode2 = { version = "2.0.1", default-features = false }
-uuid = { version = "1.8.0", features = ["v4"] }
-tokio = { version = "1.28.1", features = ["sync", "rt",  "time", "macros"] }
-log = "0.4.21"
-futures = { version = "0.3.28", features = ["alloc"] }
-async-trait = { version = "0.1.83" }
-itertools = { version = "0.13.0" }
-dashmap = { version = "6.1.0", features = ["serde"] }
-auto_impl = { version = "1.2.0" }
-num = "0.4.1"
+uuid = { version = "1.8.0", default-features = false, features = ["v4"] }
+tokio = { version = "1.28.1", default-features = false, features = ["sync", "rt",  "time", "macros"] }
+log = { version = "0.4.21", default-features = false }
+futures = { version = "0.3.28", default-features = false, features = ["alloc"] }
+async-trait = { version = "0.1.83", default-features = false }
+itertools = { version = "0.13.0", default-features = false, features = ["use_std"] }
+dashmap = { version = "6.1.0", default-features = false, features = ["serde"] }
+auto_impl = { version = "1.2.0", default-features = false }
+num = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.28.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.28.1", default-features = false, features = ["rt-multi-thread"] }
