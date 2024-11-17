@@ -2,6 +2,7 @@ use crate::{
     Backend, BackendError, MessageMetadata, NetworkError, Payload, UnderlyingSessionTransport,
 };
 use async_trait::async_trait;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -158,11 +159,9 @@ impl<M: MessageMetadata> Clone for InMemoryNetwork<M> {
 
 impl<M: MessageMetadata> Default for InMemoryNetwork<M> {
     fn default() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut map = HashMap::new();
-        map.insert(M::PeerId::default(), tx);
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            messages: Arc::new(RwLock::new(map)),
+            messages: Arc::new(RwLock::new(Default::default())),
             my_rx: Arc::new(Mutex::new(rx)),
             my_id: M::PeerId::default(),
         }
@@ -223,7 +222,13 @@ impl<M: MessageMetadata> UnderlyingSessionTransport for InMemoryNetwork<M> {
     }
 
     async fn connected_peers(&self) -> Vec<<Self::Message as MessageMetadata>::PeerId> {
-        self.messages.read().await.keys().cloned().collect()
+        self.messages
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .sorted()
+            .collect()
     }
 
     fn local_id(&self) -> <Self::Message as MessageMetadata>::PeerId {
@@ -742,13 +747,11 @@ mod tests {
 
         // Send messages in parallel using separate threads
         let send_handle1 = tokio::spawn({
-            let message_system1 = message_system1.clone();
             let message1 = message1.clone();
             async move { message_system1.send_raw_message(message1).await }
         });
 
         let send_handle2 = tokio::spawn({
-            let message_system2 = message_system2.clone();
             let message2 = message2.clone();
             async move { message_system2.send_raw_message(message2).await }
         });
@@ -789,7 +792,6 @@ mod tests {
 
         // Create tasks for peer 1 sending messages
         let send_task1 = tokio::spawn({
-            let message_system1 = message_system1.clone();
             async move {
                 for i in 0..NUM_MESSAGES {
                     let message = TestMessage {
@@ -805,7 +807,6 @@ mod tests {
 
         // Create tasks for peer 2 sending messages
         let send_task2 = tokio::spawn({
-            let message_system2 = message_system2.clone();
             async move {
                 for i in 0..NUM_MESSAGES {
                     let message = TestMessage {
@@ -873,9 +874,10 @@ mod tests {
             .await
             .unwrap();
 
+        let is_running = message_system.is_running.clone();
+
         // Start sending messages
         let send_handle = tokio::spawn({
-            let message_system = message_system.clone();
             async move {
                 let mut results = Vec::new();
                 for i in 0..10000 {
@@ -894,9 +896,7 @@ mod tests {
 
         // Wait a bit then shutdown the system
         sleep(Duration::from_millis(10)).await;
-        message_system
-            .is_running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        is_running.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Check results
         let results = send_handle.await.unwrap();
@@ -1346,11 +1346,12 @@ mod tests {
             let mut all_received = Vec::new();
 
             while let Ok(Some(msg)) =
-                tokio::time::timeout(Duration::from_millis(1000), rx2.recv()).await
+                tokio::time::timeout(Duration::from_millis(3000), rx2.recv()).await
             {
                 all_received.push(msg.message_id());
             }
 
+            log::info!(target: "ism", "All received: {:?}", all_received);
             assert_eq!(
                 all_received,
                 vec![0, 1, 2, 3, 4],

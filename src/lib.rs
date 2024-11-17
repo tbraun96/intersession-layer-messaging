@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
@@ -23,8 +23,8 @@ pub(crate) mod message_tracker;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-const OUTBOUND_POLL: Duration = Duration::from_millis(500);
-const INBOUND_POLL: Duration = Duration::from_millis(500);
+const OUTBOUND_POLL: Duration = Duration::from_millis(200);
+const INBOUND_POLL: Duration = Duration::from_millis(200);
 
 #[async_trait]
 pub trait MessageMetadata: Debug + Send + Sync + 'static {
@@ -182,31 +182,11 @@ where
     local_delivery: Arc<Mutex<Option<L>>>,
     network: Arc<N>,
     is_running: Arc<AtomicBool>,
+    is_shutting_down: Arc<AtomicBool>,
     tracker: Arc<MessageTracker<M, B>>,
     poll_inbound_tx: tokio::sync::mpsc::UnboundedSender<()>,
     poll_outbound_tx: tokio::sync::mpsc::UnboundedSender<()>,
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
-}
-
-impl<M, B, L, N> Clone for ILM<M, B, L, N>
-where
-    M: MessageMetadata + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
-    B: Backend<M> + Send + Sync + 'static,
-    L: LocalDelivery<M> + Send + Sync + 'static,
-    N: UnderlyingSessionTransport<Message = M> + Send + Sync + 'static,
-{
-    fn clone(&self) -> Self {
-        Self {
-            backend: self.backend.clone(),
-            local_delivery: self.local_delivery.clone(),
-            network: self.network.clone(),
-            is_running: self.is_running.clone(),
-            tracker: self.tracker.clone(),
-            poll_inbound_tx: self.poll_inbound_tx.clone(),
-            poll_outbound_tx: self.poll_outbound_tx.clone(),
-            known_peers: self.known_peers.clone(),
-        }
-    }
 }
 
 impl<M, B, L, N> Drop for ILM<M, B, L, N>
@@ -240,6 +220,7 @@ where
             local_delivery: Arc::new(Mutex::new(Some(local_delivery))),
             network: Arc::new(network),
             is_running: Arc::new(AtomicBool::new(true)),
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
             tracker: Arc::new(MessageTracker::new(backend).await?),
             poll_inbound_tx,
             poll_outbound_tx,
@@ -251,114 +232,96 @@ where
         Ok(this)
     }
 
+    fn clone_internal(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            local_delivery: self.local_delivery.clone(),
+            network: self.network.clone(),
+            is_running: self.is_running.clone(),
+            is_shutting_down: self.is_shutting_down.clone(),
+            tracker: self.tracker.clone(),
+            poll_inbound_tx: self.poll_inbound_tx.clone(),
+            poll_outbound_tx: self.poll_outbound_tx.clone(),
+            known_peers: self.known_peers.clone(),
+        }
+    }
+
     fn spawn_background_tasks(
         &self,
         mut poll_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         mut poll_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     ) {
         // Spawn outbound processing task
-        let self_clone = self.clone();
+        let this = self.clone_internal();
 
-        let outbound_handle = tokio::spawn(async move {
-            loop {
-                if !self_clone.can_run() {
-                    break;
-                }
+        let background_task = async move {
+            let this = &this;
 
-                tokio::select! {
-                    res0 = poll_outbound_rx.recv() => {
-                        if res0.is_none() {
-                            log::warn!(target: "ism", "Poll outbound channel closed");
-                            return;
-                        }
-                    },
-                    _res1 = sleep(OUTBOUND_POLL) => {},
-                }
-
-                self_clone.process_outbound().await;
-            }
-        });
-
-        // Spawn inbound processing task
-        let self_clone = self.clone();
-        let inbound_handle = tokio::spawn(async move {
-            loop {
-                if !self_clone.can_run() {
-                    break;
-                }
-
-                tokio::select! {
-                    biased;
-                    res0 = poll_inbound_rx.recv() => {
-                        if res0.is_none() {
-                            log::warn!(target: "ism", "Poll inbound channel closed");
-                        }
-                    },
-                    _res1 = sleep(INBOUND_POLL) => {},
-                }
-
-                self_clone.process_inbound().await;
-            }
-        });
-
-        // Spawn network listener task
-        let self_clone = self.clone();
-        let network_io_handle = tokio::spawn(async move {
-            loop {
-                if !self_clone.can_run() {
-                    break;
-                }
-
-                self_clone.process_next_network_message().await;
-            }
-        });
-
-        // Spawn task that periodically polls for connected peers to help establish intersession recovery
-        let self_clone = self.clone();
-        let peer_polling_handle = tokio::spawn(async move {
-            loop {
-                if !self_clone.can_run() {
-                    break;
-                }
-
-                let connected_peers_now = self_clone.get_connected_peers().await;
-                let mut current_peers_lock = self_clone.known_peers.lock().await;
-                let connected_peers_previous = current_peers_lock
-                    .iter()
-                    .copied()
-                    .sorted()
-                    .collect::<Vec<_>>();
-                if connected_peers_now != connected_peers_previous {
-                    log::info!(target: "ism", "Connected peers changed, sending poll for refresh in state");
-
-                    // Now, send a poll to each new connected peer
-                    for peer_id in connected_peers_now
-                        .iter()
-                        .filter(|id| !connected_peers_previous.contains(id))
-                    {
-                        if let Err(e) = self_clone
-                            .network
-                            .send_message(Payload::Poll {
-                                from_id: self_clone.network.local_id(),
-                                to_id: *peer_id,
-                            })
-                            .await
-                        {
-                            log::error!(target: "ism", "Failed to send poll to new peer: {:?}", e);
-                        }
+            let outbound_handle = async move {
+                loop {
+                    if !this.can_run() {
+                        break;
                     }
 
-                    *current_peers_lock = connected_peers_now;
+                    tokio::select! {
+                        res0 = poll_outbound_rx.recv() => {
+                            if res0.is_none() {
+                                log::warn!(target: "ism", "Poll outbound channel closed");
+                                return;
+                            }
+                        },
+                        _res1 = sleep(OUTBOUND_POLL) => {},
+                    }
+
+                    this.process_outbound().await;
                 }
+            };
 
-                sleep(Duration::from_secs(5)).await;
-            }
-        });
+            // Spawn inbound processing task
+            let inbound_handle = async move {
+                loop {
+                    if !this.can_run() {
+                        break;
+                    }
 
-        // Spawn a task that selects all three handles, and on any of them finishing, it will
-        // set the atomic bool to false
-        let self_clone = self.clone();
-        drop(tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        res0 = poll_inbound_rx.recv() => {
+                            if res0.is_none() {
+                                log::warn!(target: "ism", "Poll inbound channel closed");
+                            }
+                        },
+                        _res1 = sleep(INBOUND_POLL) => {},
+                    }
+
+                    this.process_inbound().await;
+                }
+            };
+
+            // Spawn network listener task
+            let network_io_handle = async move {
+                loop {
+                    if !this.can_run() {
+                        break;
+                    }
+
+                    this.process_next_network_message().await;
+                }
+            };
+
+            // Spawn task that periodically polls for connected peers to help establish intersession recovery
+            let peer_polling_handle = async move {
+                loop {
+                    if !this.can_run() {
+                        break;
+                    }
+
+                    this.poll_peers().await;
+
+                    sleep(Duration::from_secs(5)).await;
+                }
+            };
+
             tokio::select! {
                 _ = outbound_handle => {
                     log::error!(target: "ism", "Outbound processing task prematurely ended");
@@ -374,17 +337,51 @@ where
                 },
             }
 
-            if let Err(err) = self_clone.tracker.sync_backend().await {
+            if let Err(err) = this.tracker.sync_backend().await {
                 log::error!(target: "ism", "Failed to sync tracker state to backend on shutdown hook: {err:?}");
             }
 
             log::warn!(target: "ism", "Message system has shut down");
 
-            self_clone
-                .is_running
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            drop(self_clone.local_delivery.lock().await.take());
-        }));
+            this.toggle_off();
+            drop(this.local_delivery.lock().await.take());
+        };
+
+        // Spawn a task that selects all three handles, and on any of them finishing, it will
+        // set the atomic bool to false
+        drop(tokio::spawn(background_task));
+    }
+
+    async fn poll_peers(&self) {
+        let connected_peers_now = self.get_connected_peers().await;
+        let mut current_peers_lock = self.known_peers.lock().await;
+        let connected_peers_previous = current_peers_lock
+            .iter()
+            .copied()
+            .sorted()
+            .collect::<Vec<_>>();
+        if connected_peers_now != connected_peers_previous {
+            log::info!(target: "ism", "Connected peers changed to {connected_peers_now:?}, sending poll for refresh in state");
+
+            // Now, send a poll to each new connected peer
+            for peer_id in connected_peers_now
+                .iter()
+                .filter(|id| !connected_peers_previous.contains(id))
+            {
+                if let Err(e) = self
+                    .send_message_internal(Payload::Poll {
+                        from_id: self.network.local_id(),
+                        to_id: *peer_id,
+                    })
+                    .await
+                {
+                    log::error!(target: "ism", "Failed to send poll to new peer: {:?}", e);
+                    break;
+                }
+            }
+
+            *current_peers_lock = connected_peers_now;
+        }
     }
 
     async fn process_outbound(&self) {
@@ -406,7 +403,6 @@ where
         }
 
         let connected_peers = &self.network.connected_peers().await;
-        let self_clone = &self.clone();
         // Process each peer's messages concurrently
         futures::stream::iter(grouped_messages).for_each_concurrent(None, |(peer_id, messages)|  {
             async move {
@@ -421,12 +417,12 @@ where
                 // Find the first message we can send based on ACKs
                 'peer: for msg in messages {
                     let message_id = msg.message_id();
-                    if self_clone.tracker.can_send(&peer_id, &message_id) {
+                    if self.tracker.can_send(&peer_id, &message_id) {
                         log::trace!(target: "ism", "[CAN SEND] message: {:?}", msg);
-                        if let Err(e) = self_clone.network.send_message(Payload::Message(msg)).await {
+                        if let Err(e) = self.send_message_internal(Payload::Message(msg)).await {
                             log::error!(target: "ism", "Failed to send message: {:?}", e);
                         } else {
-                            if let Err(err) = self_clone.tracker.mark_sent(peer_id, message_id).await {
+                            if let Err(err) = self.tracker.mark_sent(peer_id, message_id).await {
                                 log::error!(target: "ism", "Failed to mark message as sent: {err:?}");
                             }
                             // Stop after sending the first message that can be sent
@@ -455,9 +451,10 @@ where
         let pending_messages: Vec<M> = pending_messages
             .into_iter()
             .sorted_by_key(|r| r.message_id())
+            .unique_by(|r| r.message_id())
             .collect();
 
-        log::trace!(target: "ism", "Processing inbound messages: {:?}", pending_messages);
+        log::trace!(target: "ism", "~~~Processing inbound messages: {:?}", pending_messages);
         if let Some(delivery) = self.local_delivery.lock().await.as_ref() {
             for message in pending_messages {
                 if self
@@ -476,16 +473,19 @@ where
                     }
                     continue;
                 }
+
                 match delivery.deliver(message.clone()).await {
                     Ok(()) => {
+                        log::trace!(target: "ism", "Successfully delivered message: {message:?}");
+                        self.tracker
+                            .has_delivered
+                            .insert((message.source_id(), message.message_id()));
                         // Create and send ACK
                         if let Err(e) = self
-                            .network
-                            .send_message(self.create_ack_message(&message))
+                            .send_message_internal(self.create_ack_message(&message))
                             .await
                         {
                             log::error!(target: "ism", "Failed to send ACK: {e:?}");
-                            continue;
                         }
 
                         // Clear delivered message from backend
@@ -498,7 +498,7 @@ where
                         }
                     }
                     Err(e) => {
-                        log::error!(target: "ism", "Failed to deliver message: {e:?}");
+                        log::error!(target: "ism", "Failed to deliver message {message:?}: {e:?}");
                     }
                 }
             }
@@ -560,8 +560,7 @@ where
                         }) {
                             log::warn!(target: "ism", "Received duplicate message, sending ACK");
                             if let Err(e) = self
-                                .network
-                                .send_message(self.create_ack_message(&msg))
+                                .send_message_internal(self.create_ack_message(&msg))
                                 .await
                             {
                                 log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
@@ -589,8 +588,7 @@ where
                         Ok(false) => {
                             // Already received this message, just send ACK
                             if let Err(e) = self
-                                .network
-                                .send_message(self.create_ack_message(&msg))
+                                .send_message_internal(self.create_ack_message(&msg))
                                 .await
                             {
                                 log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
@@ -641,7 +639,7 @@ where
             });
         }
 
-        if self.is_running.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.can_run() {
             self.backend
                 .store_outbound(message)
                 .await
@@ -672,25 +670,48 @@ where
 
     /// Shutdown the message system gracefully
     /// This will stop the background tasks and wait for pending outbound messages to be processed
-    pub async fn shutdown(self, timeout: Duration) -> Result<(), NetworkError<M>> {
+    pub async fn shutdown(&self, timeout: Duration) -> Result<(), NetworkError<M>> {
+        if self.is_shutting_down.fetch_or(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         // Wait for pending messages to be processed
         tokio::time::timeout(timeout, async {
-            while !self
-                .backend
-                .get_pending_outbound()
-                .await
-                .map_err(NetworkError::BackendError)?
-                .is_empty()
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            let pending_outbound_task = async move {
+                while !self
+                    .backend
+                    .get_pending_outbound()
+                    .await
+                    .map_err(NetworkError::BackendError)?
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+
+                Ok(())
+            };
+
+            let pending_inbound_task = async move {
+                while !self
+                    .backend
+                    .get_pending_inbound()
+                    .await
+                    .map_err(NetworkError::BackendError)?
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+
+                Ok(())
+            };
+
+            tokio::try_join!(pending_outbound_task, pending_inbound_task)?;
+
             Ok::<_, NetworkError<M>>(())
         })
         .await
         .map_err(|err| NetworkError::ShutdownFailed(err.to_string()))??;
 
-        self.is_running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.toggle_off();
 
         Ok(())
     }
@@ -710,6 +731,24 @@ where
     }
 
     fn can_run(&self) -> bool {
-        self.is_running.load(std::sync::atomic::Ordering::Relaxed)
+        self.is_running.load(Ordering::Relaxed)
+    }
+
+    fn toggle_off(&self) {
+        self.is_running.store(false, Ordering::SeqCst);
+    }
+
+    async fn send_message_internal(
+        &self,
+        message: Payload<M>,
+    ) -> Result<(), NetworkError<Payload<M>>> {
+        let res = self.network.send_message(message).await;
+
+        if res.is_err() {
+            // Since I/O is corrupt, there is no chance of safe shutdown or recovery
+            // at this time. We will just set the atomic bool to false and return the error
+        }
+
+        res
     }
 }
