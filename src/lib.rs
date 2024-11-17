@@ -23,8 +23,8 @@ pub(crate) mod message_tracker;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-const OUTBOUND_POLL: Duration = Duration::from_millis(200);
-const INBOUND_POLL: Duration = Duration::from_millis(200);
+const OUTBOUND_POLL: Duration = Duration::from_millis(500);
+const INBOUND_POLL: Duration = Duration::from_millis(500);
 
 #[async_trait]
 pub trait MessageMetadata: Debug + Send + Sync + 'static {
@@ -96,6 +96,31 @@ pub enum Payload<M: MessageMetadata> {
         from_id: M::PeerId,
         to_id: M::PeerId,
     },
+}
+
+impl<M: MessageMetadata> Payload<M> {
+    pub fn source_id(&self) -> M::PeerId {
+        match self {
+            Payload::Ack { from_id, .. } => *from_id,
+            Payload::Message(msg) => msg.source_id(),
+            Payload::Poll { from_id, .. } => *from_id,
+        }
+    }
+    pub fn destination_id(&self) -> M::PeerId {
+        match self {
+            Payload::Ack { to_id, .. } => *to_id,
+            Payload::Message(msg) => msg.destination_id(),
+            Payload::Poll { to_id, .. } => *to_id,
+        }
+    }
+
+    pub fn message_id(&self) -> Option<M::MessageId> {
+        match self {
+            Payload::Ack { message_id, .. } => Some(*message_id),
+            Payload::Message(msg) => Some(msg.message_id()),
+            Payload::Poll { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -192,7 +217,9 @@ where
     N: UnderlyingSessionTransport<Message = M> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        let _ = self.poll_outbound_tx.send(());
+        if Arc::strong_count(&self.is_running) == 1 {
+            let _ = self.poll_outbound_tx.send(());
+        }
     }
 }
 
@@ -231,7 +258,6 @@ where
     ) {
         // Spawn outbound processing task
         let self_clone = self.clone();
-        let is_alive = self.is_running.clone();
 
         let outbound_handle = tokio::spawn(async move {
             loop {
@@ -240,10 +266,10 @@ where
                 }
 
                 tokio::select! {
-                    biased;
                     res0 = poll_outbound_rx.recv() => {
                         if res0.is_none() {
                             log::warn!(target: "ism", "Poll outbound channel closed");
+                            return;
                         }
                     },
                     _res1 = sleep(OUTBOUND_POLL) => {},
@@ -295,26 +321,20 @@ where
                     break;
                 }
 
-                let connected_peers_now = self_clone
-                    .network
-                    .connected_peers()
-                    .await
-                    .into_iter()
-                    .sorted()
-                    .collect::<Vec<_>>();
+                let connected_peers_now = self_clone.get_connected_peers().await;
                 let mut current_peers_lock = self_clone.known_peers.lock().await;
-                let current_peers_previous = current_peers_lock
+                let connected_peers_previous = current_peers_lock
                     .iter()
                     .copied()
                     .sorted()
                     .collect::<Vec<_>>();
-                if connected_peers_now != current_peers_previous {
+                if connected_peers_now != connected_peers_previous {
                     log::info!(target: "ism", "Connected peers changed, sending poll for refresh in state");
 
                     // Now, send a poll to each new connected peer
                     for peer_id in connected_peers_now
                         .iter()
-                        .filter(|id| !current_peers_previous.contains(id))
+                        .filter(|id| !connected_peers_previous.contains(id))
                     {
                         if let Err(e) = self_clone
                             .network
@@ -360,7 +380,9 @@ where
 
             log::warn!(target: "ism", "Message system has shut down");
 
-            is_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            self_clone
+                .is_running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             drop(self_clone.local_delivery.lock().await.take());
         }));
     }
@@ -671,6 +693,15 @@ where
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
+    }
+
+    pub async fn get_connected_peers(&self) -> Vec<M::PeerId> {
+        self.network
+            .connected_peers()
+            .await
+            .into_iter()
+            .sorted()
+            .collect::<Vec<_>>()
     }
 
     /// Returns the ID of this node in the network
