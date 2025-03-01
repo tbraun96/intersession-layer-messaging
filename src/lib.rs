@@ -149,6 +149,8 @@ pub enum DeliveryError {
 // Modified Backend trait to handle both outbound and inbound messages
 #[async_trait]
 #[auto_impl::auto_impl(&, Arc, Box)]
+/// Each local client that uses a backend needs to have a different backend in order
+/// to not have collisions in the message tracker
 pub trait Backend<M: MessageMetadata> {
     async fn store_outbound(&self, message: M) -> Result<(), BackendError<M>>;
     async fn store_inbound(&self, message: M) -> Result<(), BackendError<M>>;
