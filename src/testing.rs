@@ -13,22 +13,32 @@ use tokio::sync::{Mutex, RwLock};
 pub struct InMemoryBackend<M: MessageMetadata> {
     outbound: Mailbox<M::PeerId, M::MessageId, M>,
     inbound: Mailbox<M::PeerId, M::MessageId, M>,
+    #[cfg(not(target_arch = "wasm32"))]
     random_dir: std::path::PathBuf,
+    #[cfg(target_arch = "wasm32")]
+    key_value_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
 type Mailbox<PeerId, MessageId, Message> = Arc<RwLock<HashMap<(PeerId, MessageId), Message>>>;
 
 impl<M: MessageMetadata> InMemoryBackend<M> {
     pub fn new() -> Self {
-        let random_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string() + "/");
-        if let Err(err) = std::fs::create_dir_all(&random_dir) {
-            log::error!(target: "ism", "Failed to create random directory: {err}");
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let random_dir = {
+            let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string() + "/");
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                log::error!(target: "ism", "Failed to create random directory: {err}");
+            }
+            dir
+        };
 
         Self {
             outbound: Arc::new(RwLock::new(HashMap::new())),
             inbound: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(not(target_arch = "wasm32"))]
             random_dir,
+            #[cfg(target_arch = "wasm32")]
+            key_value_store: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -122,18 +132,37 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
     }
 
     async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>> {
-        // Store the bytes to the temp directory + key.bin
-        let path = self.random_dir.join(format!("{key}.bin"));
-        std::fs::write(path, value).map_err(|err| BackendError::StorageError(err.to_string()))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Store the bytes to the temp directory + key.bin
+            let path = self.random_dir.join(format!("{key}.bin"));
+            std::fs::write(path, value).map_err(|err| BackendError::StorageError(err.to_string()))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Store in memory for WASM
+            let mut store = self.key_value_store.write().await;
+            store.insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
     }
 
     async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>> {
-        // Load the bytes from the temp directory + key.bin
-        let path = self.random_dir.join(format!("{key}.bin"));
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(BackendError::StorageError(err.to_string())),
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Load the bytes from the temp directory + key.bin
+            let path = self.random_dir.join(format!("{key}.bin"));
+            match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(BackendError::StorageError(err.to_string())),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Load from memory for WASM
+            let store = self.key_value_store.read().await;
+            Ok(store.get(key).cloned())
         }
     }
 }
@@ -717,7 +746,8 @@ mod tests {
         assert_eq!(still_pending[0].message_id(), message.message_id());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_bidirectional_parallel_messaging() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
@@ -776,7 +806,8 @@ mod tests {
         assert_eq!(received2.contents(), &[1]);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_bidirectional_messaging_stress() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
@@ -864,7 +895,8 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_message_system_shutdown_during_send() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
@@ -905,7 +937,8 @@ mod tests {
             .any(|r| matches!(r, Err(NetworkError::SystemShutdown))));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_empty_message_contents() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
@@ -932,7 +965,8 @@ mod tests {
         assert!(received.contents().is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_local_delivery_drop() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
@@ -967,7 +1001,8 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_max_message_id() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
@@ -994,7 +1029,8 @@ mod tests {
         assert_eq!(received.message_id(), usize::MAX);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_backend_error_handling() {
         struct FailingBackend;
 
@@ -1069,7 +1105,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_intersession_recovery() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
