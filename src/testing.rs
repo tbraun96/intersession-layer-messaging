@@ -2,11 +2,11 @@ use crate::{
     Backend, BackendError, MessageMetadata, NetworkError, Payload, UnderlyingSessionTransport,
 };
 use async_trait::async_trait;
+use citadel_io::tokio::sync::{Mutex, RwLock};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
 
 // Example InMemoryBackend implementation
 #[derive(Clone)]
@@ -169,12 +169,12 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
 
 pub struct InMemoryNetwork<M: MessageMetadata> {
     messages: InMemoryMessageQueue<M::PeerId, M>,
-    my_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Payload<M>>>>,
+    my_rx: Arc<Mutex<citadel_io::tokio::sync::mpsc::UnboundedReceiver<Payload<M>>>>,
     my_id: M::PeerId,
 }
 
 pub type InMemoryMessageQueue<PeerId, M> =
-    Arc<RwLock<HashMap<PeerId, tokio::sync::mpsc::UnboundedSender<Payload<M>>>>>;
+    Arc<RwLock<HashMap<PeerId, citadel_io::tokio::sync::mpsc::UnboundedSender<Payload<M>>>>>;
 
 impl<M: MessageMetadata> Clone for InMemoryNetwork<M> {
     fn clone(&self) -> Self {
@@ -188,7 +188,7 @@ impl<M: MessageMetadata> Clone for InMemoryNetwork<M> {
 
 impl<M: MessageMetadata> Default for InMemoryNetwork<M> {
     fn default() -> Self {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         Self {
             messages: Arc::new(RwLock::new(Default::default())),
             my_rx: Arc::new(Mutex::new(rx)),
@@ -203,7 +203,7 @@ impl<M: MessageMetadata> InMemoryNetwork<M> {
     }
 
     pub async fn add_peer(&self, id: M::PeerId) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         self.messages.write().await.insert(id, tx);
         Self {
             messages: self.messages.clone(),
@@ -317,6 +317,7 @@ mod tests {
     use crate::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
     use crate::{Backend, BackendError, MessageMetadata, NetworkError, Payload, ILM};
     use async_trait::async_trait;
+    use citadel_io::tokio::time::sleep;
     use citadel_logging::setup_log;
     use futures::stream::FuturesOrdered;
     use futures::StreamExt;
@@ -324,9 +325,8 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::time::Duration;
-    use tokio::time::sleep;
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_two_peers_send_receive() {
         let network = InMemoryNetwork::<TestMessage>::new();
         let network1 = network.add_peer(1).await;
@@ -335,8 +335,8 @@ mod tests {
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
 
-        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, mut rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let messenger1 = ILM::new(backend1, tx1, network1).await.unwrap();
         let messenger2 = ILM::new(backend2, tx2, network2).await.unwrap();
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(received_message2.contents(), &[1, 2, 3]);
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_message_system_basic() {
         let mut peer_futures = FuturesOrdered::new();
         const NUM_PEERS: usize = 3;
@@ -369,7 +369,7 @@ mod tests {
         for this_peer_id in 0..NUM_PEERS {
             let network = network.add_peer(this_peer_id).await;
             let backend = InMemoryBackend::<TestMessage>::default();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
             let future = async move {
@@ -416,11 +416,11 @@ mod tests {
         assert_eq!(sum, NUM_PEERS);
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_send_message_to_self() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
@@ -435,11 +435,11 @@ mod tests {
         assert!(matches!(result, Err(NetworkError::SendFailed { .. })));
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_send_message_with_mismatched_source_id() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
@@ -454,11 +454,11 @@ mod tests {
         assert!(matches!(result, Err(NetworkError::SendFailed { .. })));
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_handle_acks_properly() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -492,7 +492,7 @@ mod tests {
         assert!(pending_outbound.is_empty());
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_message_ordering() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
@@ -500,8 +500,8 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
 
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
         let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
@@ -540,11 +540,11 @@ mod tests {
         assert_eq!(received_messages[1].contents(), &[1]);
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_stop_message_system() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
 
@@ -563,14 +563,14 @@ mod tests {
         assert!(matches!(result, Err(NetworkError::SystemShutdown)));
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_stress_send_large_number_of_messages() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
         let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
@@ -604,11 +604,11 @@ mod tests {
         assert_eq!(received_count, NUM_MESSAGES);
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_invalid_peer_handling() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -633,14 +633,14 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_duplicate_message_handling() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -677,11 +677,11 @@ mod tests {
         assert!(rx2.try_recv().is_err()); // No second message should be received
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_message_system_shutdown_cleanup() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -710,11 +710,11 @@ mod tests {
         assert!(local_delivery.is_none());
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_message_persistence_until_delivery() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -746,15 +746,15 @@ mod tests {
         assert_eq!(still_pending[0].message_id(), message.message_id());
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_bidirectional_parallel_messaging() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, mut rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
         let message_system2 = ILM::new(backend2, tx2, network2.clone()).await.unwrap();
@@ -776,12 +776,12 @@ mod tests {
         };
 
         // Send messages in parallel using separate threads
-        let send_handle1 = tokio::spawn({
+        let send_handle1 = citadel_io::tokio::spawn({
             let message1 = message1.clone();
             async move { message_system1.send_raw_message(message1).await }
         });
 
-        let send_handle2 = tokio::spawn({
+        let send_handle2 = citadel_io::tokio::spawn({
             let message2 = message2.clone();
             async move { message_system2.send_raw_message(message2).await }
         });
@@ -806,15 +806,15 @@ mod tests {
         assert_eq!(received2.contents(), &[1]);
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_bidirectional_messaging_stress() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, mut rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
         let message_system2 = ILM::new(backend2, tx2, network2.clone()).await.unwrap();
@@ -822,7 +822,7 @@ mod tests {
         const NUM_MESSAGES: u8 = 255;
 
         // Create tasks for peer 1 sending messages
-        let send_task1 = tokio::spawn({
+        let send_task1 = citadel_io::tokio::spawn({
             async move {
                 for i in 0..NUM_MESSAGES {
                     let message = TestMessage {
@@ -837,7 +837,7 @@ mod tests {
         });
 
         // Create tasks for peer 2 sending messages
-        let send_task2 = tokio::spawn({
+        let send_task2 = citadel_io::tokio::spawn({
             async move {
                 for i in 0..NUM_MESSAGES {
                     let message = TestMessage {
@@ -852,11 +852,11 @@ mod tests {
         });
 
         // Create tasks for receiving messages
-        let receive_task1 = tokio::spawn(async move {
+        let receive_task1 = citadel_io::tokio::spawn(async move {
             let mut received = 0;
             while received < NUM_MESSAGES {
                 if let Ok(Some(msg)) =
-                    tokio::time::timeout(Duration::from_secs(5), rx1.recv()).await
+                    citadel_io::tokio::time::timeout(Duration::from_secs(5), rx1.recv()).await
                 {
                     assert_eq!(msg.source_id(), 2);
                     assert_eq!(msg.destination_id(), 1);
@@ -868,11 +868,11 @@ mod tests {
             }
         });
 
-        let receive_task2 = tokio::spawn(async move {
+        let receive_task2 = citadel_io::tokio::spawn(async move {
             let mut received = 0;
             while received < NUM_MESSAGES {
                 if let Ok(Some(msg)) =
-                    tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await
+                    citadel_io::tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await
                 {
                     assert_eq!(msg.source_id(), 1);
                     assert_eq!(msg.destination_id(), 2);
@@ -895,12 +895,12 @@ mod tests {
         }
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_message_system_shutdown_during_send() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -909,7 +909,7 @@ mod tests {
         let is_running = message_system.is_running.clone();
 
         // Start sending messages
-        let send_handle = tokio::spawn({
+        let send_handle = citadel_io::tokio::spawn({
             async move {
                 let mut results = Vec::new();
                 for i in 0..10000 {
@@ -937,15 +937,15 @@ mod tests {
             .any(|r| matches!(r, Err(NetworkError::SystemShutdown))));
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_empty_message_contents() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
         let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
@@ -965,12 +965,12 @@ mod tests {
         assert!(received.contents().is_empty());
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_local_delivery_drop() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -1001,15 +1001,15 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_max_message_id() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
         let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
@@ -1029,8 +1029,8 @@ mod tests {
         assert_eq!(received.message_id(), usize::MAX);
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_backend_error_handling() {
         struct FailingBackend;
 
@@ -1087,7 +1087,7 @@ mod tests {
         }
 
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(FailingBackend, tx, network.clone()).await.unwrap();
 
@@ -1105,14 +1105,14 @@ mod tests {
         ));
     }
 
-    //#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[tokio::test]
+    //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[citadel_io::tokio::test]
     async fn test_intersession_recovery() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
             .await
@@ -1139,7 +1139,7 @@ mod tests {
 
         // Should receive all messages in order due to polling
         for i in 0..3 {
-            match tokio::time::timeout(Duration::from_secs(6), rx2.recv()).await {
+            match citadel_io::tokio::time::timeout(Duration::from_secs(6), rx2.recv()).await {
                 Ok(Some(received)) => {
                     assert_eq!(received.message_id(), i);
                     assert_eq!(received.contents(), &[i as u8]);
@@ -1150,14 +1150,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_graceful_shutdown() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let network2 = network.add_peer(2).await;
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
             .await
@@ -1193,11 +1193,11 @@ mod tests {
         assert_eq!(received_messages, vec![0, 1, 2]);
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_shutdown_timeout() {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let backend = InMemoryBackend::<TestMessage>::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let message_system = ILM::new(backend.clone(), tx, network.clone())
             .await
@@ -1220,7 +1220,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_message_id_persistence_between_sessions() {
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
@@ -1229,8 +1229,8 @@ mod tests {
 
         // First session
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+            let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
             let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
@@ -1259,8 +1259,8 @@ mod tests {
 
         // Second session - should continue from where first session left off
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+            let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
             let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
@@ -1284,7 +1284,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_ack_state_persistence_between_sessions() {
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let backend2 = InMemoryBackend::<TestMessage>::default();
@@ -1293,8 +1293,8 @@ mod tests {
 
         // First session - send messages but don't wait for ACKs
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+            let (tx2, _rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
             let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
@@ -1314,8 +1314,8 @@ mod tests {
 
         // Second session - verify message is still pending
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+            let (tx2, _rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
             let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
@@ -1331,7 +1331,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_crash_recovery_with_partial_state() {
         setup_log();
         let backend1 = InMemoryBackend::<TestMessage>::default();
@@ -1341,8 +1341,8 @@ mod tests {
 
         // First session - simulate crash during message sending
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+            let (tx2, _rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
             let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
@@ -1364,8 +1364,8 @@ mod tests {
 
         // Second session - should recover and continue properly
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+            let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
             let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
@@ -1383,7 +1383,7 @@ mod tests {
             let mut all_received = Vec::new();
 
             while let Ok(Some(msg)) =
-                tokio::time::timeout(Duration::from_millis(3000), rx2.recv()).await
+                citadel_io::tokio::time::timeout(Duration::from_millis(3000), rx2.recv()).await
             {
                 all_received.push(msg.message_id());
             }
@@ -1397,7 +1397,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[citadel_io::tokio::test]
     async fn test_multiple_peer_state_persistence() {
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
@@ -1406,7 +1406,7 @@ mod tests {
 
         // First session - send messages to multiple peers
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();
@@ -1425,7 +1425,7 @@ mod tests {
 
         // Second session - verify state for both peers
         {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
                 .await
                 .unwrap();

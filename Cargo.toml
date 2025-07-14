@@ -19,7 +19,7 @@ citadel_logging = { workspace = true }
 serde = { version = "1.0.104", default-features = false, features = ["derive"] }
 bincode2 = { version = "2.0.1", default-features = false }
 uuid = { version = "1.8.0", default-features = false, features = ["v4"] }
-tokio = { version = "1.28.1", default-features = false, features = ["sync", "rt",  "time", "macros", "io-util"] }
+citadel_io = { workspace = true, default-features = false }
 log = { version = "0.4.21", default-features = false }
 futures = { version = "0.3.28", default-features = false, features = ["alloc"] }
 async-trait = { version = "0.1.83", default-features = false }

@@ -14,8 +14,8 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use citadel_io::tokio::sync::Mutex;
+use citadel_io::tokio::time::{sleep, Duration};
 
 pub mod local_delivery;
 pub(crate) mod message_tracker;
@@ -186,8 +186,8 @@ where
     is_running: Arc<AtomicBool>,
     is_shutting_down: Arc<AtomicBool>,
     tracker: Arc<MessageTracker<M, B>>,
-    poll_inbound_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    poll_outbound_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    poll_inbound_tx: citadel_io::tokio::sync::mpsc::UnboundedSender<()>,
+    poll_outbound_tx: citadel_io::tokio::sync::mpsc::UnboundedSender<()>,
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
 }
 
@@ -213,8 +213,8 @@ where
     N: UnderlyingSessionTransport<Message = M> + Send + Sync + 'static,
 {
     pub async fn new(backend: B, local_delivery: L, network: N) -> Result<Self, BackendError<M>> {
-        let (poll_inbound_tx, poll_inbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (poll_outbound_tx, poll_outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (poll_inbound_tx, poll_inbound_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (poll_outbound_tx, poll_outbound_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let backend = Arc::new(backend);
         let this = Self {
@@ -250,8 +250,8 @@ where
 
     fn spawn_background_tasks(
         &self,
-        mut poll_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-        mut poll_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        mut poll_inbound_rx: citadel_io::tokio::sync::mpsc::UnboundedReceiver<()>,
+        mut poll_outbound_rx: citadel_io::tokio::sync::mpsc::UnboundedReceiver<()>,
     ) {
         // Spawn outbound processing task
         let this = self.clone_internal();
@@ -265,7 +265,7 @@ where
                         break;
                     }
 
-                    tokio::select! {
+                    citadel_io::tokio::select! {
                         res0 = poll_outbound_rx.recv() => {
                             if res0.is_none() {
                                 log::warn!(target: "ism", "Poll outbound channel closed");
@@ -286,7 +286,7 @@ where
                         break;
                     }
 
-                    tokio::select! {
+                    citadel_io::tokio::select! {
                         biased;
                         res0 = poll_inbound_rx.recv() => {
                             if res0.is_none() {
@@ -324,7 +324,7 @@ where
                 }
             };
 
-            tokio::select! {
+            citadel_io::tokio::select! {
                 _ = outbound_handle => {
                     log::error!(target: "ism", "Outbound processing task prematurely ended");
                 },
@@ -351,7 +351,7 @@ where
 
         // Spawn a task that selects all three handles, and on any of them finishing, it will
         // set the atomic bool to false
-        drop(tokio::spawn(background_task));
+        drop(citadel_io::tokio::spawn(background_task));
     }
 
     async fn poll_peers(&self) {
@@ -377,7 +377,7 @@ where
                     })
                     .await
                 {
-                    log::error!(target: "ism", "Failed to send poll to new peer: {:?}", e);
+                    log::error!(target: "ism", "Failed to send poll to new peer: {e:?}");
                     break;
                 }
             }
@@ -390,7 +390,7 @@ where
         let pending_messages = match self.backend.get_pending_outbound().await {
             Ok(messages) => messages,
             Err(e) => {
-                log::error!(target: "ism", "Failed to get pending outbound messages: {:?}", e);
+                log::error!(target: "ism", "Failed to get pending outbound messages: {e:?}");
                 return;
             }
         };
@@ -420,9 +420,9 @@ where
                 'peer: for msg in messages {
                     let message_id = msg.message_id();
                     if self.tracker.can_send(&peer_id, &message_id) {
-                        log::trace!(target: "ism", "[CAN SEND] message: {:?}", msg);
+                        log::trace!(target: "ism", "[CAN SEND] message: {msg:?}");
                         if let Err(e) = self.send_message_internal(Payload::Message(msg)).await {
-                            log::error!(target: "ism", "Failed to send message: {:?}", e);
+                            log::error!(target: "ism", "Failed to send message: {e:?}");
                         } else {
                             if let Err(err) = self.tracker.mark_sent(peer_id, message_id).await {
                                 log::error!(target: "ism", "Failed to mark message as sent: {err:?}");
@@ -431,7 +431,7 @@ where
                             break 'peer;
                         }
                     } else {
-                        log::trace!(target: "ism", "[CANNOT SEND] message: {:?}", msg);
+                        log::trace!(target: "ism", "[CANNOT SEND] message: {msg:?}");
                         // If we can't send the current message, stop processing this group
                         break;
                     }
@@ -444,7 +444,7 @@ where
         let pending_messages = match self.backend.get_pending_inbound().await {
             Ok(messages) => messages,
             Err(e) => {
-                log::error!(target: "ism", "Failed to get pending inbound messages: {:?}", e);
+                log::error!(target: "ism", "Failed to get pending inbound messages: {e:?}");
                 return;
             }
         };
@@ -456,7 +456,7 @@ where
             .unique_by(|r| r.message_id())
             .collect();
 
-        log::trace!(target: "ism", "~~~Processing inbound messages: {:?}", pending_messages);
+        log::trace!(target: "ism", "~~~Processing inbound messages: {pending_messages:?}");
         if let Some(delivery) = self.local_delivery.lock().await.as_ref() {
             for message in pending_messages {
                 if self
@@ -464,7 +464,7 @@ where
                     .has_delivered
                     .contains(&(message.source_id(), message.message_id()))
                 {
-                    log::warn!(target: "ism", "Skipping already delivered message: {:?}", message);
+                    log::warn!(target: "ism", "Skipping already delivered message: {message:?}");
                     // Clear delivered message from backend
                     if let Err(e) = self
                         .backend
@@ -677,7 +677,7 @@ where
             return Ok(());
         }
         // Wait for pending messages to be processed
-        tokio::time::timeout(timeout, async {
+        citadel_io::tokio::time::timeout(timeout, async {
             let pending_outbound_task = async move {
                 while !self
                     .backend
@@ -686,7 +686,7 @@ where
                     .map_err(NetworkError::BackendError)?
                     .is_empty()
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    citadel_io::tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
                 Ok(())
@@ -700,13 +700,13 @@ where
                     .map_err(NetworkError::BackendError)?
                     .is_empty()
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    citadel_io::tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
                 Ok(())
             };
 
-            tokio::try_join!(pending_outbound_task, pending_inbound_task)?;
+            citadel_io::tokio::try_join!(pending_outbound_task, pending_inbound_task)?;
 
             Ok::<_, NetworkError<M>>(())
         })

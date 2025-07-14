@@ -9,7 +9,7 @@ pub trait LocalDelivery<M: MessageMetadata> {
 }
 
 #[async_trait]
-impl<M: MessageMetadata> LocalDelivery<M> for tokio::sync::mpsc::UnboundedSender<M> {
+impl<M: MessageMetadata> LocalDelivery<M> for citadel_io::tokio::sync::mpsc::UnboundedSender<M> {
     async fn deliver(&self, message: M) -> Result<(), DeliveryError> {
         self.send(message).map_err(|_| DeliveryError::ChannelClosed)
     }
