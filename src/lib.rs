@@ -14,8 +14,8 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
 
 pub mod local_delivery;
 pub(crate) mod message_tracker;
@@ -25,6 +25,57 @@ pub mod testing;
 
 const OUTBOUND_POLL: Duration = Duration::from_millis(200);
 const INBOUND_POLL: Duration = Duration::from_millis(200);
+
+/// Platform-agnostic async sleep function
+/// - Native: Uses tokio::time::sleep
+/// - WASM: Uses wasmtimer::tokio::sleep
+#[cfg(not(target_arch = "wasm32"))]
+async fn platform_sleep(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn platform_sleep(duration: Duration) {
+    wasmtimer::tokio::sleep(duration).await;
+}
+
+/// Platform-agnostic async timeout function
+/// - Native: Uses tokio::time::timeout
+/// - WASM: Uses wasmtimer::tokio::timeout
+#[cfg(not(target_arch = "wasm32"))]
+async fn platform_timeout<F, T>(duration: Duration, future: F) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(duration, future).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn platform_timeout<F, T>(duration: Duration, future: F) -> Result<T, wasmtimer::tokio::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    wasmtimer::tokio::timeout(duration, future).await
+}
+
+/// Platform-agnostic async spawn function
+/// - Native: Uses tokio::spawn (requires Send + 'static)
+/// - WASM: Uses wasm_bindgen_futures::spawn_local (single-threaded, no Send required)
+#[cfg(not(target_arch = "wasm32"))]
+fn platform_spawn<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    drop(tokio::spawn(future));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn platform_spawn<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    wasm_bindgen_futures::spawn_local(future);
+}
 
 #[async_trait]
 pub trait MessageMetadata: Debug + Send + Sync + 'static {
@@ -272,7 +323,7 @@ where
                                 return;
                             }
                         },
-                        _res1 = sleep(OUTBOUND_POLL) => {},
+                        _res1 = platform_sleep(OUTBOUND_POLL) => {},
                     }
 
                     this.process_outbound().await;
@@ -293,7 +344,7 @@ where
                                 log::warn!(target: "ism", "Poll inbound channel closed");
                             }
                         },
-                        _res1 = sleep(INBOUND_POLL) => {},
+                        _res1 = platform_sleep(INBOUND_POLL) => {},
                     }
 
                     this.process_inbound().await;
@@ -320,7 +371,7 @@ where
 
                     this.poll_peers().await;
 
-                    sleep(Duration::from_secs(5)).await;
+                    platform_sleep(Duration::from_secs(5)).await;
                 }
             };
 
@@ -351,7 +402,7 @@ where
 
         // Spawn a task that selects all three handles, and on any of them finishing, it will
         // set the atomic bool to false
-        drop(tokio::spawn(background_task));
+        platform_spawn(background_task);
     }
 
     async fn poll_peers(&self) {
@@ -677,7 +728,7 @@ where
             return Ok(());
         }
         // Wait for pending messages to be processed
-        tokio::time::timeout(timeout, async {
+        let result = platform_timeout(timeout, async {
             let pending_outbound_task = async move {
                 while !self
                     .backend
@@ -686,7 +737,7 @@ where
                     .map_err(NetworkError::BackendError)?
                     .is_empty()
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    platform_sleep(Duration::from_millis(100)).await;
                 }
 
                 Ok(())
@@ -700,7 +751,7 @@ where
                     .map_err(NetworkError::BackendError)?
                     .is_empty()
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    platform_sleep(Duration::from_millis(100)).await;
                 }
 
                 Ok(())
@@ -710,8 +761,12 @@ where
 
             Ok::<_, NetworkError<M>>(())
         })
-        .await
-        .map_err(|err| NetworkError::ShutdownFailed(err.to_string()))??;
+        .await;
+
+        match result {
+            Ok(inner_result) => inner_result?,
+            Err(err) => return Err(NetworkError::ShutdownFailed(err.to_string())),
+        }
 
         self.toggle_off();
 
