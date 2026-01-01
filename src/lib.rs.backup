@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use futures::{pin_mut, select, FutureExt, StreamExt};
+use futures::{future::FusedFuture, pin_mut, select, FutureExt, StreamExt};
 use itertools::Itertools;
 use local_delivery::LocalDelivery;
 use message_tracker::MessageTracker;
@@ -83,20 +83,6 @@ where
     wasm_bindgen_futures::spawn_local(future);
 }
 
-/// Platform-agnostic timestamp function (seconds since UNIX epoch)
-/// - Native: Uses std::time::UNIX_EPOCH.elapsed()
-/// - WASM: Uses js_sys::Date::now()
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn platform_timestamp_secs() -> u64 {
-    std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn platform_timestamp_secs() -> u64 {
-    // js_sys::Date::now() returns milliseconds since epoch
-    (js_sys::Date::now() / 1000.0) as u64
-}
-
 #[async_trait]
 pub trait MessageMetadata: Debug + Send + Sync + 'static {
     type PeerId: Default
@@ -166,10 +152,6 @@ pub enum Payload<M: MessageMetadata> {
     Poll {
         from_id: M::PeerId,
         to_id: M::PeerId,
-        /// The last message ID I received from you (for resync detection).
-        /// If you sent me a message but I never received it, this will be None or
-        /// lower than what you think you sent. You should then resend the missing message.
-        last_received_from_peer: Option<M::MessageId>,
     },
 }
 
@@ -226,7 +208,7 @@ pub enum DeliveryError {
 #[auto_impl::auto_impl(&, Arc, Box)]
 /// Each local client that uses a backend needs to have a different backend in order
 /// to not have collisions in the message tracker
-pub trait Backend<M: MessageMetadata>: Send + Sync {
+pub trait Backend<M: MessageMetadata> {
     async fn store_outbound(&self, message: M) -> Result<(), BackendError<M>>;
     async fn store_inbound(&self, message: M) -> Result<(), BackendError<M>>;
     async fn clear_message_inbound(
@@ -244,19 +226,6 @@ pub trait Backend<M: MessageMetadata>: Send + Sync {
     // Simple K/V interface for tracker state
     async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>>;
     async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>>;
-
-    /// Load multiple values in a single batched operation.
-    /// Default implementation calls load_value() sequentially for backwards compatibility.
-    /// Implementations should override this with a batched network call to avoid
-    /// sequential await blocking (especially important in WASM where async yields
-    /// can block the JavaScript event loop).
-    async fn load_values_batched(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>, BackendError<M>> {
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(self.load_value(key).await?);
-        }
-        Ok(results)
-    }
 }
 
 const MAX_MAP_SIZE: usize = 1000;
@@ -423,22 +392,18 @@ where
             };
 
             // Use futures::select! for WASM compatibility instead of tokio::select!
-            let outbound_handle_fused = outbound_handle.fuse();
-            let inbound_handle_fused = inbound_handle.fuse();
-            let network_io_handle_fused = network_io_handle.fuse();
-            let peer_polling_handle_fused = peer_polling_handle.fuse();
-            pin_mut!(outbound_handle_fused, inbound_handle_fused, network_io_handle_fused, peer_polling_handle_fused);
+            pin_mut!(outbound_handle, inbound_handle, network_io_handle, peer_polling_handle);
             select! {
-                _ = outbound_handle_fused => {
+                _ = outbound_handle => {
                     log::error!(target: "ism", "Outbound processing task prematurely ended");
                 },
-                _ = inbound_handle_fused => {
+                _ = inbound_handle => {
                     log::error!(target: "ism", "Inbound processing task prematurely ended");
                 },
-                _ = network_io_handle_fused => {
+                _ = network_io_handle => {
                     log::error!(target: "ism", "Network IO task prematurely ended");
                 },
-                _ = peer_polling_handle_fused => {
+                _ = peer_polling_handle => {
                     log::error!(target: "ism", "Peer polling task prematurely ended");
                 },
             }
@@ -469,20 +434,15 @@ where
         if connected_peers_now != connected_peers_previous {
             log::info!(target: "ism", "Connected peers changed to {connected_peers_now:?}, sending poll for refresh in state");
 
-            // Now, send a poll to each new connected peer with resync state
+            // Now, send a poll to each new connected peer
             for peer_id in connected_peers_now
                 .iter()
                 .filter(|id| !connected_peers_previous.contains(id))
             {
-                // Include what we last received FROM this peer, so they can detect
-                // if we missed any of their messages
-                let last_received_from_peer = self.tracker.get_last_received_from(peer_id);
-                log::info!(target: "ism", "[RESYNC] Sending Poll to peer {peer_id:?} with last_received_from_peer={last_received_from_peer:?}");
                 if let Err(e) = self
                     .send_message_internal(Payload::Poll {
                         from_id: self.network.local_id(),
                         to_id: *peer_id,
-                        last_received_from_peer,
                     })
                     .await
                 {
@@ -514,18 +474,11 @@ where
         }
 
         let connected_peers = &self.network.connected_peers().await;
-        let local_cid = self.network.local_id();
-        log::info!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: {} messages in {} groups, {} connected peers: {:?}",
-            grouped_messages.values().map(|v| v.len()).sum::<usize>(),
-            grouped_messages.len(),
-            connected_peers.len(),
-            connected_peers);
-
         // Process each peer's messages concurrently
         futures::stream::iter(grouped_messages).for_each_concurrent(None, |(peer_id, messages)|  {
             async move {
                 if !connected_peers.contains(&peer_id) {
-                    log::warn!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: Peer {peer_id} is not connected, skipping {} messages", messages.len());
+                    log::warn!(target: "ism", "Peer {peer_id} is not connected, skipping message until later");
                     return;
                 }
 
@@ -535,18 +488,11 @@ where
                 // Find the first message we can send based on ACKs
                 'peer: for msg in messages {
                     let message_id = msg.message_id();
-                    let last_acked = self.tracker.last_acked.get(&peer_id).map(|v| *v);
-                    let last_sent = self.tracker.last_sent.get(&peer_id).map(|v| *v);
-                    let can_send = self.tracker.can_send(&peer_id, &message_id);
-
-                    log::info!(target: "ism", "[ILM-OUTBOUND] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, can_send={can_send}, last_acked={last_acked:?}, last_sent={last_sent:?}");
-
-                    if can_send {
-                        log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: SENDING msg_id={message_id}");
+                    if self.tracker.can_send(&peer_id, &message_id) {
+                        log::trace!(target: "ism", "[CAN SEND] message: {:?}", msg);
                         if let Err(e) = self.send_message_internal(Payload::Message(msg)).await {
-                            log::error!(target: "ism", "[ILM-SEND] FAILED: {:?}", e);
+                            log::error!(target: "ism", "Failed to send message: {:?}", e);
                         } else {
-                            log::info!(target: "ism", "[ILM-SEND] SUCCESS: msg_id={message_id}");
                             if let Err(err) = self.tracker.mark_sent(peer_id, message_id).await {
                                 log::error!(target: "ism", "Failed to mark message as sent: {err:?}");
                             }
@@ -554,7 +500,7 @@ where
                             break 'peer;
                         }
                     } else {
-                        log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK)");
+                        log::trace!(target: "ism", "[CANNOT SEND] message: {:?}", msg);
                         // If we can't send the current message, stop processing this group
                         break;
                     }
@@ -601,17 +547,16 @@ where
 
                 match delivery.deliver(message.clone()).await {
                     Ok(()) => {
-                        log::info!(target: "ism", "[ILM-INBOUND] Delivered msg_id={} from peer {}", message.message_id(), message.source_id());
+                        log::trace!(target: "ism", "Successfully delivered message: {message:?}");
                         self.tracker
                             .has_delivered
                             .insert((message.source_id(), message.message_id()));
                         // Create and send ACK
-                        log::info!(target: "ism", "[ILM-ACK] Sending ACK for msg_id={} to peer {}", message.message_id(), message.source_id());
                         if let Err(e) = self
                             .send_message_internal(self.create_ack_message(&message))
                             .await
                         {
-                            log::error!(target: "ism", "[ILM-ACK] FAILED to send ACK: {e:?}");
+                            log::error!(target: "ism", "Failed to send ACK: {e:?}");
                         }
 
                         // Clear delivered message from backend
@@ -637,43 +582,9 @@ where
     async fn process_next_network_message(&self) {
         if let Some(message) = self.network.next_message().await {
             match message {
-                Payload::Poll {
-                    from_id,
-                    last_received_from_peer,
-                    ..
-                } => {
-                    log::info!(target: "ism", "[RESYNC] Received Poll from peer {from_id:?} with last_received_from_peer={last_received_from_peer:?}");
-
-                    // Check if the peer is missing messages we sent
-                    // `last_received_from_peer` is what THEY last received FROM US
-                    // `last_sent` is what WE last sent TO THEM
-                    let our_last_sent_to_peer = self.tracker.last_sent.get(&from_id).map(|v| *v);
-
-                    // Detect gap: we sent something but they didn't receive it
-                    let needs_resend = match (our_last_sent_to_peer, last_received_from_peer) {
-                        // We sent msg X but they have received nothing
-                        (Some(_our_sent), None) => {
-                            log::info!(target: "ism", "[RESYNC] Gap detected: we sent {:?} but peer has received nothing", _our_sent);
-                            true
-                        }
-                        // We sent msg X but they only received up to Y where Y < X
-                        (Some(our_sent), Some(their_received)) if our_sent > their_received => {
-                            log::info!(target: "ism", "[RESYNC] Gap detected: we sent {:?} but peer only received {:?}", our_sent, their_received);
-                            true
-                        }
-                        // No gap - they're up to date
-                        _ => false,
-                    };
-
-                    if needs_resend {
-                        // Clear our last_sent to allow resending the blocked message
-                        if let Err(e) = self.tracker.clear_last_sent(&from_id).await {
-                            log::error!(target: "ism", "[RESYNC] Failed to clear last_sent: {:?}", e);
-                        }
-                    }
-
-                    // Trigger process_outbound which will now be able to send
-                    // (since we cleared last_sent, can_send() will return true)
+                Payload::Poll { .. } => {
+                    // This will trigger process_outbound() which already sends
+                    // the next unacknowledged message due to head of line blocking
                     if self.poll_outbound_tx.send(()).is_err() {
                         log::warn!(target: "ism", "Failed to send poll signal for outbound messages");
                     }
@@ -684,17 +595,14 @@ where
                     message_id,
                     to_id,
                 } => {
-                    log::info!(target: "ism", "[ILM-ACK-RECV] Received ACK from_id={from_id} msg_id={message_id} to_id={to_id} local_id={}", self.network.local_id());
                     if to_id != self.network.local_id() {
-                        log::warn!(target: "ism", "[ILM-ACK-RECV] ACK not for us - ignoring");
+                        log::warn!(target: "ism", "Received ACK for another peer");
                         return;
                     }
 
                     // Update the tracker with the new ACK
                     if let Err(err) = self.tracker.update_ack(from_id, message_id).await {
-                        log::error!(target: "ism", "[ILM-ACK-RECV] Failed to update tracker: {err:?}");
-                    } else {
-                        log::info!(target: "ism", "[ILM-ACK-RECV] Tracker updated - unblocking peer {from_id}");
+                        log::error!(target: "ism", "Failed to update tracker with ACK: {err:?}");
                     }
 
                     log::trace!(target: "ism", "Received ACK from peer {from_id}, message # {message_id}");
@@ -739,16 +647,7 @@ where
                         .await
                     {
                         Ok(true) => {
-                            // New message - update last_received_from for resync tracking
-                            if let Err(e) = self
-                                .tracker
-                                .update_last_received_from(msg.source_id(), msg.message_id())
-                                .await
-                            {
-                                log::error!(target: "ism", "Failed to update last_received_from: {e:?}");
-                            }
-
-                            // Store and process the message
+                            // New message, process it
                             if let Err(e) = self.backend.store_inbound(msg).await {
                                 log::error!(target: "ism", "Failed to store inbound message: {e:?}");
                             }
@@ -822,11 +721,9 @@ where
                     err => NetworkError::BackendError(err),
                 })?;
 
-            // NOTE: Removed poll_outbound_tx.send(()) here to prevent tight feedback loop.
-            // The periodic 200ms OUTBOUND_POLL is sufficient for processing pending messages.
-            // Triggering immediate poll after every send created: process_outbound →
-            // send_message_internal → poll_outbound_tx → process_outbound → infinite loop
-            // that flooded LocalDB requests and blocked the WASM event loop.
+            self.poll_outbound_tx
+                .send(())
+                .map_err(|_| NetworkError::SystemShutdown)?;
             Ok(())
         } else {
             Err(NetworkError::SystemShutdown)

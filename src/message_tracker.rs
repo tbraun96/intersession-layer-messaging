@@ -1,8 +1,7 @@
-use crate::{Backend, BackendError, MessageMetadata, MAX_MAP_SIZE};
+use crate::{platform_timestamp_secs, Backend, BackendError, MessageMetadata, MAX_MAP_SIZE};
 use dashmap::{DashMap, DashSet};
 use num::One;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
 pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     pub last_acked: DashMap<M::PeerId, M::MessageId>,
@@ -10,6 +9,8 @@ pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     pub next_unique_id: DashMap<M::PeerId, M::MessageId>,
     pub received_messages: DashMap<(M::PeerId, M::MessageId), u64>,
     pub has_delivered: DashSet<(M::PeerId, M::MessageId)>,
+    /// Tracks the highest message ID received FROM each peer (for resync)
+    pub last_received_from: DashMap<M::PeerId, M::MessageId>,
     pub backend: Arc<B>,
 }
 
@@ -25,31 +26,49 @@ where
             next_unique_id: Default::default(),
             received_messages: Default::default(),
             has_delivered: Default::default(),
+            last_received_from: Default::default(),
             backend,
         };
 
-        // Load existing state
-        if let Some(last_acked_bytes) = tracker.backend.load_value("last_acked").await? {
-            if let Ok(map) = bincode2::deserialize(&last_acked_bytes) {
+        // Load existing state using batched request (single network roundtrip)
+        // This avoids sequential await blocking in WASM which can freeze the UI
+        let keys = [
+            "last_acked",
+            "last_sent",
+            "next_unique_id",
+            "received_messages",
+            "last_received_from",
+        ];
+        let results = tracker.backend.load_values_batched(&keys).await?;
+
+        // Process results in order
+        if let Some(Some(last_acked_bytes)) = results.get(0) {
+            if let Ok(map) = bincode2::deserialize(last_acked_bytes) {
                 tracker.last_acked = map;
             }
         }
 
-        if let Some(last_sent_bytes) = tracker.backend.load_value("last_sent").await? {
-            if let Ok(map) = bincode2::deserialize(&last_sent_bytes) {
+        if let Some(Some(last_sent_bytes)) = results.get(1) {
+            if let Ok(map) = bincode2::deserialize(last_sent_bytes) {
                 tracker.last_sent = map;
             }
         }
 
-        if let Some(next_id_bytes) = tracker.backend.load_value("next_unique_id").await? {
-            if let Ok(map) = bincode2::deserialize(&next_id_bytes) {
+        if let Some(Some(next_id_bytes)) = results.get(2) {
+            if let Ok(map) = bincode2::deserialize(next_id_bytes) {
                 tracker.next_unique_id = map;
             }
         }
 
-        if let Some(received_bytes) = tracker.backend.load_value("received_messages").await? {
-            if let Ok(map) = bincode2::deserialize(&received_bytes) {
+        if let Some(Some(received_bytes)) = results.get(3) {
+            if let Ok(map) = bincode2::deserialize(received_bytes) {
                 tracker.received_messages = map;
+            }
+        }
+
+        if let Some(Some(last_received_bytes)) = results.get(4) {
+            if let Ok(map) = bincode2::deserialize(last_received_bytes) {
+                tracker.last_received_from = map;
             }
         }
 
@@ -122,7 +141,7 @@ where
 
         let _ = self
             .received_messages
-            .insert((peer_id, msg_id), UNIX_EPOCH.elapsed().unwrap().as_secs());
+            .insert((peer_id, msg_id), platform_timestamp_secs());
         self.drop_lru_if_full();
         self.backend
             .store_value(
@@ -141,6 +160,47 @@ where
                 let _ = self.received_messages.remove(oldest.key());
             }
         }
+    }
+
+    /// Clears the last_sent entry for a peer, allowing messages to be resent.
+    /// This is used during resync when we detect that a peer never received our message.
+    pub async fn clear_last_sent(&self, peer_id: &M::PeerId) -> Result<(), BackendError<M>> {
+        if self.last_sent.remove(peer_id).is_some() {
+            log::info!(target: "ism", "[RESYNC] Cleared last_sent for peer {:?}, allowing resend", peer_id);
+            self.backend
+                .store_value("last_sent", &bincode2::serialize(&self.last_sent).unwrap())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Gets the last message ID received from a specific peer (for resync)
+    pub fn get_last_received_from(&self, peer_id: &M::PeerId) -> Option<M::MessageId> {
+        self.last_received_from.get(peer_id).map(|v| *v)
+    }
+
+    /// Updates the last received message ID from a peer
+    pub async fn update_last_received_from(
+        &self,
+        peer_id: M::PeerId,
+        msg_id: M::MessageId,
+    ) -> Result<(), BackendError<M>> {
+        // Only update if this is a higher message ID
+        let should_update = match self.last_received_from.get(&peer_id) {
+            Some(current) => msg_id > *current,
+            None => true,
+        };
+
+        if should_update {
+            self.last_received_from.insert(peer_id, msg_id);
+            self.backend
+                .store_value(
+                    "last_received_from",
+                    &bincode2::serialize(&self.last_received_from).unwrap(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     // Sync all states to the backend
@@ -164,6 +224,12 @@ where
             .store_value(
                 "received_messages",
                 &bincode2::serialize(&self.received_messages).unwrap(),
+            )
+            .await?;
+        self.backend
+            .store_value(
+                "last_received_from",
+                &bincode2::serialize(&self.last_received_from).unwrap(),
             )
             .await?;
         Ok(())

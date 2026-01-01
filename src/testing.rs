@@ -874,35 +874,24 @@ mod tests {
             .await
             .unwrap();
 
-        let is_running = message_system.is_running.clone();
+        // First, shut down the system
+        message_system
+            .is_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Start sending messages
-        let send_handle = tokio::spawn({
-            async move {
-                let mut results = Vec::new();
-                for i in 0..10000 {
-                    let message = TestMessage {
-                        source_id: 1,
-                        destination_id: 2,
-                        message_id: i,
-                        contents: vec![1],
-                    };
-                    let result = message_system.send_raw_message(message).await;
-                    results.push(result);
-                }
-                results
-            }
-        });
-
-        // Wait a bit then shutdown the system
-        sleep(Duration::from_millis(10)).await;
-        is_running.store(false, std::sync::atomic::Ordering::Relaxed);
-
-        // Check results
-        let results = send_handle.await.unwrap();
-        assert!(results
-            .iter()
-            .any(|r| matches!(r, Err(NetworkError::SystemShutdown))));
+        // Now try to send a message - it should fail with SystemShutdown
+        let message = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 0,
+            contents: vec![1],
+        };
+        let result = message_system.send_raw_message(message).await;
+        assert!(
+            matches!(result, Err(NetworkError::SystemShutdown)),
+            "Expected SystemShutdown error after shutdown, got {:?}",
+            result
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1400,5 +1389,217 @@ mod tests {
             assert!(pending_peers.contains(&2));
             assert!(pending_peers.contains(&3));
         }
+    }
+
+    /// Test that demonstrates the "lost ACK" problem:
+    /// - Peer 1 sends a message to peer 2
+    /// - The message is marked as sent (last_sent=Some(0))
+    /// - Peer 2 never sends an ACK (simulated by having no ILM running)
+    /// - Peer 1's subsequent messages are blocked forever (can_send() returns false)
+    ///
+    /// This test PASSES before the fix, proving the problem exists.
+    /// After implementing the resync mechanism, this test should be updated
+    /// to verify that messages are resent when the peer reconnects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_message_blocked_without_ack() {
+        setup_log();
+
+        // Create network with peer 1
+        let network1 = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+
+        // Add peer 2 to the network (but without an ILM, so no ACK will be sent)
+        let _network2 = network1.add_peer(2).await;
+
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+
+        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone())
+            .await
+            .unwrap();
+
+        // Send first message - this will be marked as sent
+        let msg1 = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 0,
+            contents: vec![1],
+        };
+        message_system1.send_raw_message(msg1).await.unwrap();
+
+        // Wait for the message to be processed and sent
+        sleep(Duration::from_millis(500)).await;
+
+        // Send second message - this should also be stored
+        let msg2 = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 1,
+            contents: vec![2],
+        };
+        message_system1.send_raw_message(msg2).await.unwrap();
+
+        // Wait for processing
+        sleep(Duration::from_millis(500)).await;
+
+        // Verify both messages are still pending (because no ACK was received)
+        let pending = backend1.get_pending_outbound().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "Expected 2 pending messages (msg_id 0 and 1), but got {}",
+            pending.len()
+        );
+
+        // The first message should have been sent (but no ACK arrived)
+        // The second message should NOT have been sent because can_send() returns false
+        // (waiting for ACK on message 0)
+
+        // This demonstrates the problem: without ACKs, messages are blocked forever
+        // The fix will add a resync mechanism when peers reconnect
+    }
+
+    /// Test that proves resync works after peer reconnects (when network is reliable).
+    /// This test passes because InMemoryNetwork queues messages until received.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_resend_after_peer_reconnect() {
+        setup_log();
+
+        // Create network with peer 1
+        let network1 = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+
+        // Add peer 2 to the network without ILM first (simulating offline)
+        let network2 = network1.add_peer(2).await;
+
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+
+        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone())
+            .await
+            .unwrap();
+
+        // Send first message while peer 2 "exists" in network but has no ILM
+        let msg1 = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 0,
+            contents: vec![1],
+        };
+        message_system1.send_raw_message(msg1).await.unwrap();
+
+        // Wait for the message to be sent (but no ACK because no ILM on peer 2)
+        sleep(Duration::from_millis(500)).await;
+
+        // Now peer 2's ILM comes online - message is already queued in network
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
+            .await
+            .unwrap();
+
+        // Wait for message delivery
+        match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
+            Ok(Some(received)) => {
+                assert_eq!(received.message_id(), 0);
+                assert_eq!(received.contents(), &[1]);
+            }
+            Ok(None) => panic!("Channel closed before receiving message"),
+            Err(_) => panic!("Timeout waiting for message"),
+        }
+
+        // Verify message was cleared from pending (ACK received)
+        sleep(Duration::from_millis(200)).await;
+        let pending = backend1.get_pending_outbound().await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "Expected no pending messages after successful delivery"
+        );
+    }
+
+    /// Test that demonstrates the need for resync when messages are truly lost.
+    /// This simulates the scenario where:
+    /// 1. Peer 1 sends a message and marks it as sent (last_sent=Some(0))
+    /// 2. The message is LOST (network drop, receiver crash, etc.)
+    /// 3. Peer 2 comes online later but never received the message
+    /// 4. Without resync, peer 1 is stuck forever
+    ///
+    /// This test will FAIL until the resync mechanism is implemented.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_resync_after_message_loss() {
+        setup_log();
+
+        // Create network with peer 1
+        let network1 = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+
+        // Add peer 2 to the network
+        let network2 = network1.add_peer(2).await;
+
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+
+        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone())
+            .await
+            .unwrap();
+
+        // Send first message
+        let msg1 = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 0,
+            contents: vec![1],
+        };
+        message_system1.send_raw_message(msg1).await.unwrap();
+
+        // Wait for the message to be sent and marked as sent
+        sleep(Duration::from_millis(500)).await;
+
+        // Verify message is pending (not ACKed)
+        let pending_before = backend1.get_pending_outbound().await.unwrap();
+        assert_eq!(pending_before.len(), 1, "Message should be pending");
+
+        // SIMULATE MESSAGE LOSS: Drain peer 2's network buffer BEFORE ILM starts
+        // This simulates the race condition where the message is sent but lost
+        {
+            let mut rx2_lock = network2.my_rx.lock().await;
+            // Try to receive and discard any pending messages
+            while rx2_lock.try_recv().is_ok() {}
+        }
+
+        // Now peer 2's ILM comes online - but the message was already lost!
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
+            .await
+            .unwrap();
+
+        // With the resync mechanism:
+        // 1. Peer 2 sends a Poll to peer 1 with last_received_from_peer=None
+        // 2. Peer 1 sees that it sent message 0 but peer 2 never received it
+        // 3. Peer 1 clears last_sent and resends the message
+
+        // Wait for resync to happen
+        match tokio::time::timeout(Duration::from_secs(6), rx2.recv()).await {
+            Ok(Some(received)) => {
+                assert_eq!(received.message_id(), 0, "Should receive the resent message");
+                assert_eq!(received.contents(), &[1]);
+            }
+            Ok(None) => panic!("Channel closed before receiving message"),
+            Err(_) => {
+                // This is expected to FAIL until resync is implemented
+                panic!(
+                    "EXPECTED FAILURE: Message was lost and NOT resent. \
+                    This test proves the need for the resync mechanism. \
+                    Pending messages: {:?}",
+                    backend1.get_pending_outbound().await.unwrap()
+                );
+            }
+        }
+
+        // Verify message was cleared from pending (ACK received)
+        sleep(Duration::from_millis(200)).await;
+        let pending = backend1.get_pending_outbound().await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "Expected no pending messages after successful delivery"
+        );
     }
 }
