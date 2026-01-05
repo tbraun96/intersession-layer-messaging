@@ -1579,7 +1579,11 @@ mod tests {
         // Wait for resync to happen
         match tokio::time::timeout(Duration::from_secs(6), rx2.recv()).await {
             Ok(Some(received)) => {
-                assert_eq!(received.message_id(), 0, "Should receive the resent message");
+                assert_eq!(
+                    received.message_id(),
+                    0,
+                    "Should receive the resent message"
+                );
                 assert_eq!(received.contents(), &[1]);
             }
             Ok(None) => panic!("Channel closed before receiving message"),

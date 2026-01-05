@@ -250,7 +250,10 @@ pub trait Backend<M: MessageMetadata>: Send + Sync {
     /// Implementations should override this with a batched network call to avoid
     /// sequential await blocking (especially important in WASM where async yields
     /// can block the JavaScript event loop).
-    async fn load_values_batched(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>, BackendError<M>> {
+    async fn load_values_batched(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError<M>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
             results.push(self.load_value(key).await?);
@@ -427,7 +430,12 @@ where
             let inbound_handle_fused = inbound_handle.fuse();
             let network_io_handle_fused = network_io_handle.fuse();
             let peer_polling_handle_fused = peer_polling_handle.fuse();
-            pin_mut!(outbound_handle_fused, inbound_handle_fused, network_io_handle_fused, peer_polling_handle_fused);
+            pin_mut!(
+                outbound_handle_fused,
+                inbound_handle_fused,
+                network_io_handle_fused,
+                peer_polling_handle_fused
+            );
             select! {
                 _ = outbound_handle_fused => {
                     log::error!(target: "ism", "Outbound processing task prematurely ended");
