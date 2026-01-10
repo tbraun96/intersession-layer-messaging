@@ -1523,6 +1523,122 @@ mod tests {
     /// 4. Without resync, peer 1 is stuck forever
     ///
     /// This test will FAIL until the resync mechanism is implemented.
+    /// Test that simulates Test 8 (Hard Disconnect) scenario:
+    /// 1. Alice and Bob are connected and exchange messages successfully
+    /// 2. Bob explicitly disconnects (sign-out, not TCP drop)
+    /// 3. Alice queues 3 messages while Bob is offline
+    /// 4. Bob reconnects (new ILM instance, same backend to preserve state)
+    /// 5. The 3 queued messages should be delivered
+    ///
+    /// This differs from `test_resync_after_message_loss`:
+    /// - Here, messages are QUEUED (never sent) because peer was offline
+    /// - In resync test, message was SENT but LOST (network drop after send)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_hard_disconnect_queued_message_delivery() {
+        setup_log();
+
+        // Create shared network
+        let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+        let network2 = network.add_peer(2).await;
+
+        // Create backends that persist across reconnections
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+
+        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
+            .await
+            .unwrap();
+        let message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
+            .await
+            .unwrap();
+
+        // Step 1: Alice sends a message to Bob successfully
+        let msg0 = TestMessage {
+            source_id: 1,
+            destination_id: 2,
+            message_id: 0,
+            contents: vec![0],
+        };
+        message_system1.send_raw_message(msg0).await.unwrap();
+
+        // Wait for Bob to receive and ACK
+        let received = rx2.recv().await.expect("Bob should receive message 0");
+        assert_eq!(received.message_id(), 0);
+
+        // Wait for ACK to be processed
+        sleep(Duration::from_millis(500)).await;
+
+        // Verify message 0 is cleared from pending (ACKed)
+        let pending_before = backend1.get_pending_outbound().await.unwrap();
+        assert!(pending_before.is_empty(), "Message 0 should be ACKed");
+
+        // Step 2: Bob disconnects (drop the ILM and remove from network)
+        // This simulates explicit sign-out
+        drop(message_system2);
+        drop(rx2);
+
+        // Remove Bob from the connected peers (simulate disconnect)
+        {
+            let mut messages = network.messages.write().await;
+            messages.remove(&2);
+        }
+
+        // Wait for disconnect to propagate
+        sleep(Duration::from_millis(200)).await;
+
+        // Step 3: Alice sends 3 messages while Bob is offline
+        for i in 1..=3 {
+            let msg = TestMessage {
+                source_id: 1,
+                destination_id: 2,
+                message_id: i,
+                contents: vec![i as u8],
+            };
+            message_system1.send_raw_message(msg).await.unwrap();
+        }
+
+        // Wait for outbound processing attempts
+        sleep(Duration::from_millis(500)).await;
+
+        // Verify messages are queued (not sent because Bob is offline)
+        let pending = backend1.get_pending_outbound().await.unwrap();
+        assert_eq!(pending.len(), 3, "3 messages should be queued");
+
+        // Step 4: Bob reconnects (new network entry, new ILM, same backend)
+        let network2_new = network.add_peer(2).await;
+        let (tx2_new, mut rx2_new) = tokio::sync::mpsc::unbounded_channel();
+        let _message_system2_new = ILM::new(backend2.clone(), tx2_new, network2_new)
+            .await
+            .unwrap();
+
+        // Step 5: Verify the 3 queued messages are delivered
+        for i in 1..=3 {
+            match tokio::time::timeout(Duration::from_secs(6), rx2_new.recv()).await {
+                Ok(Some(received)) => {
+                    assert_eq!(received.message_id(), i, "Expected message {}", i);
+                    assert_eq!(received.contents(), &[i as u8]);
+                }
+                Ok(None) => panic!("Channel closed before receiving message {}", i),
+                Err(_) => panic!(
+                    "Timeout waiting for message {}. Pending: {:?}",
+                    i,
+                    backend1.get_pending_outbound().await.unwrap()
+                ),
+            }
+        }
+
+        // Verify all messages are now delivered (pending should be empty after ACKs)
+        sleep(Duration::from_millis(500)).await;
+        let final_pending = backend1.get_pending_outbound().await.unwrap();
+        assert!(
+            final_pending.is_empty(),
+            "All messages should be delivered and ACKed"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_resync_after_message_loss() {
         setup_log();
