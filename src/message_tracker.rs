@@ -42,7 +42,7 @@ where
         let results = tracker.backend.load_values_batched(&keys).await?;
 
         // Process results in order
-        if let Some(Some(last_acked_bytes)) = results.get(0) {
+        if let Some(Some(last_acked_bytes)) = results.first() {
             if let Ok(map) = bincode2::deserialize(last_acked_bytes) {
                 tracker.last_acked = map;
             }

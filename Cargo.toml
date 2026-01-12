@@ -16,6 +16,7 @@ testing = []
 
 [dependencies]
 citadel_logging = { workspace = true }
+citadel_io = { workspace = true }
 serde = { version = "1.0.104", default-features = false, features = ["derive"] }
 bincode2 = { version = "2.0.1", default-features = false }
 uuid = { version = "1.8.0", default-features = false, features = ["v4"] }
