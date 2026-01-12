@@ -305,7 +305,8 @@ where
 {
     pub async fn new(backend: B, local_delivery: L, network: N) -> Result<Self, BackendError<M>> {
         let (poll_inbound_tx, poll_inbound_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
-        let (poll_outbound_tx, poll_outbound_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+        let (poll_outbound_tx, poll_outbound_rx) =
+            citadel_io::tokio::sync::mpsc::unbounded_channel();
 
         let backend = Arc::new(backend);
         let this = Self {

@@ -1825,7 +1825,10 @@ mod tests {
 
         // Verify it's cleared
         let acked_after_clear = ilm1.tracker.last_acked.get(&2).map(|v| *v);
-        assert_eq!(acked_after_clear, None, "last_acked should be None after clear");
+        assert_eq!(
+            acked_after_clear, None,
+            "last_acked should be None after clear"
+        );
 
         // ============================================================
         // Step 3: Peer 2 sends a Poll with last_received_from_peer=0
@@ -1834,7 +1837,11 @@ mod tests {
 
         // Peer 2's tracker knows it received message 0 from Peer 1
         let last_received = ilm2.tracker.get_last_received_from(&1);
-        assert_eq!(last_received, Some(0), "Peer 2 should have received msg 0 from Peer 1");
+        assert_eq!(
+            last_received,
+            Some(0),
+            "Peer 2 should have received msg 0 from Peer 1"
+        );
 
         // Wait for Peer 1 to process network messages (Poll will trigger implicit ACK update)
         // We need to trigger the peer refresh mechanism
@@ -1871,7 +1878,8 @@ mod tests {
                 let last_acked = ilm1.tracker.last_acked.get(&2).map(|v| *v);
                 log::warn!(
                     "[TEST] Message not delivered. Tracker state: last_sent={:?}, last_acked={:?}",
-                    last_sent, last_acked
+                    last_sent,
+                    last_acked
                 );
                 // The fix ensures that even with stale last_acked, messages can still be sent
                 // through the RESYNC mechanism (clear last_sent on gap detection)
