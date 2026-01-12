@@ -652,6 +652,18 @@ where
                 } => {
                     log::info!(target: "ism", "[RESYNC] Received Poll from peer {from_id:?} with last_received_from_peer={last_received_from_peer:?}");
 
+                    // CRITICAL: Update last_acked based on what peer reports receiving.
+                    // This acts as an implicit ACK for all messages up to last_received_from_peer.
+                    // Without this, after hard disconnect/reconnect, our messages remain blocked
+                    // waiting for ACKs that were lost during the disconnect.
+                    if let Some(their_received) = last_received_from_peer {
+                        if let Err(e) = self.tracker.update_ack(from_id, their_received).await {
+                            log::error!(target: "ism", "[RESYNC] Failed to update last_acked from Poll: {:?}", e);
+                        } else {
+                            log::info!(target: "ism", "[RESYNC] Updated last_acked[{from_id:?}] = {their_received:?} (implicit ACK)");
+                        }
+                    }
+
                     // Check if the peer is missing messages we sent
                     // `last_received_from_peer` is what THEY last received FROM US
                     // `last_sent` is what WE last sent TO THEM
