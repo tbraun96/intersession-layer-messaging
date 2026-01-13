@@ -1904,4 +1904,127 @@ mod tests {
             Err(_) => panic!("Timeout waiting for return message"),
         }
     }
+
+    /// Test: Stale last_sent without last_acked should be cleared on init
+    ///
+    /// This reproduces a bug where after hard disconnect:
+    /// 1. last_sent has an entry (message was sent)
+    /// 2. last_acked is None (ACK never received before crash/disconnect)
+    /// 3. can_send() returns false forever: (None, Some(_)) => false
+    ///
+    /// The fix in MessageTracker::new() clears stale last_sent entries
+    /// when there's no corresponding last_acked entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_stale_last_sent_cleared_on_init() {
+        setup_log();
+
+        // Create backends that persist across reconnections
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+
+        let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+        let network2 = network.add_peer(2).await;
+
+        // First session: send message but simulate crash before ACK is received
+        {
+            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+
+            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
+                .await
+                .unwrap();
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
+                .await
+                .unwrap();
+
+            // Send a message from peer 1 to peer 2
+            let msg = TestMessage {
+                source_id: 1,
+                destination_id: 2,
+                message_id: 0,
+                contents: vec![0],
+            };
+            message_system1.send_raw_message(msg).await.unwrap();
+
+            // Wait for peer 2 to receive the message
+            let received = rx2.recv().await.expect("Peer 2 should receive message");
+            assert_eq!(received.message_id(), 0);
+
+            // Simulate crash BEFORE ACK is processed by peer 1
+            // By dropping everything immediately, the ACK from peer 2 may not reach peer 1
+            // This creates the inconsistent state: last_sent=Some(0), last_acked=None
+        }
+
+        // Give some time for any in-flight operations
+        sleep(Duration::from_millis(100)).await;
+
+        // Manually corrupt the state to simulate the bug scenario:
+        // Set last_sent without last_acked for peer 2
+        backend1
+            .store_value(
+                "last_sent",
+                &bincode2::serialize(&{
+                    let map: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+                    map.insert(2u64, 5u64); // last_sent[peer_2] = 5
+                    map
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Ensure last_acked is empty (no ACK received)
+        backend1
+            .store_value(
+                "last_acked",
+                &bincode2::serialize(&dashmap::DashMap::<u64, u64>::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Create new network for session 2
+        let network_new = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+        let network2_new = network_new.add_peer(2).await;
+
+        // Second session: reinitialize with the corrupted state
+        // The fix should detect and clear the stale last_sent entry
+        {
+            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+
+            // This should trigger the fix: clear last_sent[2] since last_acked[2] is None
+            let message_system1 = ILM::new(backend1.clone(), tx1, network_new.clone())
+                .await
+                .unwrap();
+            let _message_system2 = ILM::new(backend2.clone(), tx2, network2_new.clone())
+                .await
+                .unwrap();
+
+            // Now send a new message - without the fix, this would be blocked forever
+            let new_msg = TestMessage {
+                source_id: 1,
+                destination_id: 2,
+                message_id: 10,
+                contents: vec![10],
+            };
+            message_system1.send_raw_message(new_msg).await.unwrap();
+
+            // Verify message is delivered (proves can_send returned true)
+            match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
+                Ok(Some(received)) => {
+                    assert_eq!(received.message_id(), 10);
+                    log::info!(
+                        "[TEST] SUCCESS: Message delivered after stale last_sent was cleared"
+                    );
+                }
+                Ok(None) => panic!("Channel closed - message not delivered"),
+                Err(_) => {
+                    panic!(
+                        "TIMEOUT: Message blocked! The stale last_sent fix may not be working. \
+                        Without the fix, can_send returns false for (None, Some(_)) case."
+                    );
+                }
+            }
+        }
+    }
 }
