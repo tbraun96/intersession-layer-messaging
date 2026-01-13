@@ -653,43 +653,42 @@ where
                 } => {
                     log::info!(target: "ism", "[RESYNC] Received Poll from peer {from_id:?} with last_received_from_peer={last_received_from_peer:?}");
 
-                    // CRITICAL: Update last_acked based on what peer reports receiving.
-                    // This acts as an implicit ACK for all messages up to last_received_from_peer.
-                    // Without this, after hard disconnect/reconnect, our messages remain blocked
-                    // waiting for ACKs that were lost during the disconnect.
-                    if let Some(their_received) = last_received_from_peer {
+                    // If peer reports receiving nothing (fresh state after reconnect),
+                    // fully reset our tracking state for that peer to allow fresh communication.
+                    // This handles the case where the sender has stale state from before disconnect.
+                    if last_received_from_peer.is_none() {
+                        log::info!(target: "ism", "[RESYNC] Peer {from_id:?} reports fresh state - clearing our tracking");
+                        self.tracker.last_sent.remove(&from_id);
+                        self.tracker.last_acked.remove(&from_id);
+                        if let Err(e) = self.tracker.sync_backend().await {
+                            log::error!(target: "ism", "[RESYNC] Failed to sync backend after clearing: {:?}", e);
+                        }
+                    } else if let Some(their_received) = last_received_from_peer {
+                        // CRITICAL: Update last_acked based on what peer reports receiving.
+                        // This acts as an implicit ACK for all messages up to last_received_from_peer.
+                        // Without this, after hard disconnect/reconnect, our messages remain blocked
+                        // waiting for ACKs that were lost during the disconnect.
                         if let Err(e) = self.tracker.update_ack(from_id, their_received).await {
                             log::error!(target: "ism", "[RESYNC] Failed to update last_acked from Poll: {:?}", e);
                         } else {
                             log::info!(target: "ism", "[RESYNC] Updated last_acked[{from_id:?}] = {their_received:?} (implicit ACK)");
                         }
-                    }
 
-                    // Check if the peer is missing messages we sent
-                    // `last_received_from_peer` is what THEY last received FROM US
-                    // `last_sent` is what WE last sent TO THEM
-                    let our_last_sent_to_peer = self.tracker.last_sent.get(&from_id).map(|v| *v);
+                        // Check if the peer is missing messages we sent
+                        // `last_received_from_peer` is what THEY last received FROM US
+                        // `last_sent` is what WE last sent TO THEM
+                        let our_last_sent_to_peer =
+                            self.tracker.last_sent.get(&from_id).map(|v| *v);
 
-                    // Detect gap: we sent something but they didn't receive it
-                    let needs_resend = match (our_last_sent_to_peer, last_received_from_peer) {
-                        // We sent msg X but they have received nothing
-                        (Some(_our_sent), None) => {
-                            log::info!(target: "ism", "[RESYNC] Gap detected: we sent {:?} but peer has received nothing", _our_sent);
-                            true
-                        }
-                        // We sent msg X but they only received up to Y where Y < X
-                        (Some(our_sent), Some(their_received)) if our_sent > their_received => {
-                            log::info!(target: "ism", "[RESYNC] Gap detected: we sent {:?} but peer only received {:?}", our_sent, their_received);
-                            true
-                        }
-                        // No gap - they're up to date
-                        _ => false,
-                    };
-
-                    if needs_resend {
-                        // Clear our last_sent to allow resending the blocked message
-                        if let Err(e) = self.tracker.clear_last_sent(&from_id).await {
-                            log::error!(target: "ism", "[RESYNC] Failed to clear last_sent: {:?}", e);
+                        // Detect gap: we sent something but they only received part
+                        if let Some(our_sent) = our_last_sent_to_peer {
+                            if our_sent > their_received {
+                                log::info!(target: "ism", "[RESYNC] Gap detected: we sent {:?} but peer only received {:?}", our_sent, their_received);
+                                // Clear our last_sent to allow resending the blocked message
+                                if let Err(e) = self.tracker.clear_last_sent(&from_id).await {
+                                    log::error!(target: "ism", "[RESYNC] Failed to clear last_sent: {:?}", e);
+                                }
+                            }
                         }
                     }
 

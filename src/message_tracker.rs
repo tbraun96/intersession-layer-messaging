@@ -90,12 +90,52 @@ where
             needs_persist = true;
         }
 
+        // Validate next_unique_id is not behind last_sent or last_acked.
+        // This prevents message ID conflicts when state is partially loaded
+        // (e.g., next_unique_id wasn't persisted but last_sent/last_acked was).
+        for entry in tracker.last_sent.iter() {
+            let peer_id = *entry.key();
+            let last_sent_id = *entry.value();
+            let min_next = last_sent_id + M::MessageId::one();
+
+            let current_next = tracker.next_unique_id.get(&peer_id).map(|v| *v);
+            if current_next.is_none() || current_next.unwrap() < min_next {
+                log::info!(target: "ism", "[RESYNC-INIT] Updating next_unique_id[{:?}] from {:?} to {:?}",
+                    peer_id, current_next, min_next);
+                tracker.next_unique_id.insert(peer_id, min_next);
+                needs_persist = true;
+            }
+        }
+
+        // Also check against last_acked (in case last_sent was cleared but last_acked remains)
+        for entry in tracker.last_acked.iter() {
+            let peer_id = *entry.key();
+            let last_acked_id = *entry.value();
+            let min_next = last_acked_id + M::MessageId::one();
+
+            let current_next = tracker.next_unique_id.get(&peer_id).map(|v| *v);
+            if current_next.is_none() || current_next.unwrap() < min_next {
+                log::info!(target: "ism", "[RESYNC-INIT] Updating next_unique_id[{:?}] from {:?} to {:?} (based on last_acked)",
+                    peer_id, current_next, min_next);
+                tracker.next_unique_id.insert(peer_id, min_next);
+                needs_persist = true;
+            }
+        }
+
         if needs_persist {
+            // Persist all modified state
             tracker
                 .backend
                 .store_value(
                     "last_sent",
                     &bincode2::serialize(&tracker.last_sent).unwrap(),
+                )
+                .await?;
+            tracker
+                .backend
+                .store_value(
+                    "next_unique_id",
+                    &bincode2::serialize(&tracker.next_unique_id).unwrap(),
                 )
                 .await?;
         }
