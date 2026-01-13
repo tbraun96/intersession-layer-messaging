@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::{pin_mut, select, FutureExt, StreamExt};
 use itertools::Itertools;
 use local_delivery::LocalDelivery;
@@ -264,6 +265,9 @@ pub trait Backend<M: MessageMetadata>: Send + Sync {
 
 const MAX_MAP_SIZE: usize = 1000;
 
+/// Max consecutive blocks before clearing stale state for a peer
+const MAX_CONSECUTIVE_BLOCKS: u32 = 10;
+
 pub struct ILM<M, B, L, N>
 where
     M: MessageMetadata + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
@@ -280,6 +284,8 @@ where
     poll_inbound_tx: citadel_io::tokio::sync::mpsc::UnboundedSender<()>,
     poll_outbound_tx: citadel_io::tokio::sync::mpsc::UnboundedSender<()>,
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
+    /// Tracks consecutive block counts per peer for fallback clearing
+    blocked_count: Arc<DashMap<M::PeerId, u32>>,
 }
 
 impl<M, B, L, N> Drop for ILM<M, B, L, N>
@@ -319,6 +325,7 @@ where
             poll_inbound_tx,
             poll_outbound_tx,
             known_peers: Arc::new(Mutex::new(Vec::new())),
+            blocked_count: Arc::new(DashMap::new()),
         };
 
         this.spawn_background_tasks(poll_inbound_rx, poll_outbound_rx);
@@ -337,6 +344,7 @@ where
             poll_inbound_tx: self.poll_inbound_tx.clone(),
             poll_outbound_tx: self.poll_outbound_tx.clone(),
             known_peers: self.known_peers.clone(),
+            blocked_count: self.blocked_count.clone(),
         }
     }
 
@@ -559,11 +567,33 @@ where
                             if let Err(err) = self.tracker.mark_sent(peer_id, message_id).await {
                                 log::error!(target: "ism", "Failed to mark message as sent: {err:?}");
                             }
+                            // Reset block counter on successful send
+                            self.blocked_count.remove(&peer_id);
                             // Stop after sending the first message that can be sent
                             break 'peer;
                         }
                     } else {
-                        log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK)");
+                        // Increment block counter for this peer
+                        let mut block_count = self.blocked_count.entry(peer_id).or_insert(0);
+                        *block_count += 1;
+                        let current_count = *block_count;
+                        drop(block_count);
+
+                        log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK), consecutive_blocks={current_count}");
+
+                        // If blocked too many times, peer likely reconnected with fresh state
+                        // Clear stale tracking to allow message delivery
+                        if current_count >= MAX_CONSECUTIVE_BLOCKS {
+                            log::warn!(target: "ism", "[ILM-BLOCKED-RECOVERY] CID {local_cid} -> peer {peer_id}: clearing stale state after {current_count} consecutive blocks");
+                            self.tracker.last_sent.remove(&peer_id);
+                            self.tracker.last_acked.remove(&peer_id);
+                            if let Err(e) = self.tracker.sync_backend().await {
+                                log::error!(target: "ism", "[ILM-BLOCKED-RECOVERY] Failed to sync backend: {:?}", e);
+                            }
+                            self.blocked_count.remove(&peer_id);
+                            // Continue processing - next iteration should succeed
+                            continue 'peer;
+                        }
                         // If we can't send the current message, stop processing this group
                         break;
                     }
