@@ -93,7 +93,10 @@ where
         if needs_persist {
             tracker
                 .backend
-                .store_value("last_sent", &bincode2::serialize(&tracker.last_sent).unwrap())
+                .store_value(
+                    "last_sent",
+                    &bincode2::serialize(&tracker.last_sent).unwrap(),
+                )
                 .await?;
         }
 
