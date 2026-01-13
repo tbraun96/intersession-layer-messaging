@@ -72,6 +72,31 @@ where
             }
         }
 
+        // Handle reconnection inconsistency: if last_sent has entries but last_acked
+        // doesn't have corresponding entries for those peers, clear last_sent.
+        // This happens after hard disconnect when ACK was never received.
+        // Without this fix, can_send() returns false forever for (None, Some(_)) case.
+        let mut needs_persist = false;
+        let peers_to_clear: Vec<_> = tracker
+            .last_sent
+            .iter()
+            .filter(|entry| !tracker.last_acked.contains_key(entry.key()))
+            .map(|entry| *entry.key())
+            .collect();
+
+        for peer_id in peers_to_clear {
+            log::info!(target: "ism", "[RESYNC-INIT] Clearing stale last_sent for peer {:?} (no corresponding ACK)", peer_id);
+            tracker.last_sent.remove(&peer_id);
+            needs_persist = true;
+        }
+
+        if needs_persist {
+            tracker
+                .backend
+                .store_value("last_sent", &bincode2::serialize(&tracker.last_sent).unwrap())
+                .await?;
+        }
+
         Ok(tracker)
     }
 
