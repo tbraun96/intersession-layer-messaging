@@ -15,22 +15,29 @@ categories = ["network-programming", "asynchronous"]
 testing = []
 
 [dependencies]
-citadel_logging = { workspace = true }
+citadel_logging = { git = "https://github.com/Avarok-Cybersecurity/Citadel-Protocol", default-features = false, branch = "stability-improvements" }
+citadel_io = { git = "https://github.com/Avarok-Cybersecurity/Citadel-Protocol", default-features = false, branch = "stability-improvements" }
 serde = { version = "1.0.104", default-features = false, features = ["derive"] }
 bincode2 = { version = "2.0.1", default-features = false }
 uuid = { version = "1.8.0", default-features = false, features = ["v4"] }
-citadel_io = { workspace = true, default-features = false }
+tokio = { version = "1.28.1", default-features = false, features = ["sync", "rt", "macros"] }
 log = { version = "0.4.21", default-features = false }
-futures = { version = "0.3.28", default-features = false, features = ["alloc"] }
+futures = { version = "0.3.28", default-features = false, features = ["alloc", "std", "async-await"] }
 async-trait = { version = "0.1.83", default-features = false }
 itertools = { version = "0.14.0", default-features = false, features = ["use_std"] }
 dashmap = { version = "6.1.0", default-features = false, features = ["serde"] }
 auto_impl = { version = "1.2.0", default-features = false }
 num = { version = "0.4.1", default-features = false }
 
-# For wasm32-unknown-unknown, add uuid with the js feature
+# WASM-compatible time and spawn support
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-uuid = { version = "1.8.0", default-features = false, features = ["v4", "js"] }
+wasmtimer = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+# Native time support
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.28.1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
-#tokio = { version = "1.28.1", default-features = false, features = ["rt-multi-thread"] }
+tokio = { version = "1.28.1", default-features = false, features = ["rt-multi-thread", "time"] }
