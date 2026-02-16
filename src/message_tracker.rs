@@ -188,7 +188,7 @@ where
 
         match (last_acked, last_sent) {
             (None, None) => true,
-            (None, Some(_)) => false, // Wait for first ACK
+            (None, Some(last_sent)) => *msg_id > *last_sent, // Allow newer messages even without first ACK
             (Some(last_acked), Some(last_sent)) => *msg_id > *last_acked && *msg_id > *last_sent,
             (Some(last_acked), None) => *msg_id > *last_acked,
         }
