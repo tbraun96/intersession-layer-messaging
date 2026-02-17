@@ -484,7 +484,7 @@ where
             .sorted()
             .collect::<Vec<_>>();
         if connected_peers_now != connected_peers_previous {
-            log::info!(target: "ism", "Connected peers changed to {connected_peers_now:?}, sending poll for refresh in state");
+            log::info!(target: "ism", "[RESYNC-PEERS] CID {}: Peers changed from {:?} to {:?}", self.network.local_id(), connected_peers_previous, connected_peers_now);
 
             // Now, send a poll to each new connected peer with resync state
             for peer_id in connected_peers_now
@@ -591,8 +591,12 @@ where
                                 log::error!(target: "ism", "[ILM-BLOCKED-RECOVERY] Failed to sync backend: {:?}", e);
                             }
                             self.blocked_count.remove(&peer_id);
-                            // Continue processing - next iteration should succeed
-                            continue 'peer;
+                            // Break and let the next poll cycle retry from the beginning
+                            // with clean state. Using `continue 'peer` here would skip to
+                            // the next message (higher ID), setting last_sent higher than
+                            // the blocked message's ID and permanently preventing it from
+                            // satisfying msg_id > last_sent.
+                            break 'peer;
                         }
                         // If we can't send the current message, stop processing this group
                         break;
