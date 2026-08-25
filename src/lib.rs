@@ -615,11 +615,27 @@ where
             }
         };
 
-        // Sort the pending messages in order by MessageID
+        // De-duplicate by (source, id) — NOT by id alone.
+        //
+        // Message IDs come from `get_next_id`, which keeps a counter PER PEER,
+        // so every peer's ids start at zero and collide with every other
+        // peer's. De-duplicating the whole inbound queue on the id alone
+        // therefore dropped one peer's message from the batch whenever another
+        // peer had a message with the same number pending.
+        //
+        // Not data loss, and worth being precise about: the delivered message
+        // is cleared from the backend afterwards, so the one that lost the tie
+        // is still pending on the next poll and is delivered then. The effect
+        // was a needless one-cycle delay per collision, and a de-duplication
+        // rule that disagreed with the backend, which has always keyed inbound
+        // by (source_id, message_id).
+        //
+        // The outbound path already does this correctly, because there the
+        // de-duplication runs after the messages are grouped by peer.
         let pending_messages: Vec<M> = pending_messages
             .into_iter()
             .sorted_by_key(|r| r.message_id())
-            .unique_by(|r| r.message_id())
+            .unique_by(|r| (r.source_id(), r.message_id()))
             .collect();
 
         log::trace!(target: "ism", "~~~Processing inbound messages: {pending_messages:?}");
