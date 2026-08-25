@@ -13,7 +13,7 @@
 //! mechanism, and it is the first test this crate has.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
-use intersession_layer_messaging::{Backend, ILM, MessageMetadata};
+use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -28,11 +28,21 @@ async fn messages_from_different_peers_sharing_an_id_are_both_delivered() {
     // Same message_id (0), different senders — the exact shape produced by two
     // per-peer counters that both start at zero.
     backend
-        .store_inbound(TestMessage::construct_from_parts(ALICE, LOCAL, 0, b"from alice".to_vec()))
+        .store_inbound(TestMessage::construct_from_parts(
+            ALICE,
+            LOCAL,
+            0,
+            b"from alice".to_vec(),
+        ))
         .await
         .expect("store alice");
     backend
-        .store_inbound(TestMessage::construct_from_parts(BOB, LOCAL, 0, b"from bob".to_vec()))
+        .store_inbound(TestMessage::construct_from_parts(
+            BOB,
+            LOCAL,
+            0,
+            b"from bob".to_vec(),
+        ))
         .await
         .expect("store bob");
 
