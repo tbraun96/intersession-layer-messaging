@@ -143,11 +143,32 @@ where
         Ok(tracker)
     }
 
+    /// Records an acknowledgement, monotonically.
+    ///
+    /// `last_acked` is a high-water mark, and an ACK for an OLDER id must never
+    /// move it backwards. Duplicate and out-of-order ACKs are normal traffic --
+    /// a retransmission is acknowledged again, and nothing on this path
+    /// promises ordering -- so an unconditional insert lets a late ACK re-open
+    /// a window the sender has already closed, and `can_send` then re-sends
+    /// messages the peer has long since received.
+    ///
+    /// This was always latent; re-ACKing duplicates made it routine rather
+    /// than rare, which is how it surfaced.
     pub async fn update_ack(
         &self,
         peer_id: M::PeerId,
         msg_id: M::MessageId,
     ) -> Result<(), BackendError<M>> {
+        // The Ref is confined to this statement: holding a dashmap read guard
+        // across the insert below would deadlock.
+        let stale = self
+            .last_acked
+            .get(&peer_id)
+            .map(|current| msg_id <= *current)
+            .unwrap_or(false);
+        if stale {
+            return Ok(());
+        }
         self.last_acked.insert(peer_id, msg_id);
         self.backend
             .store_value(
@@ -301,5 +322,59 @@ where
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::MessageTracker;
+    use crate::testing::{InMemoryBackend, TestMessage};
+    use std::sync::Arc;
+
+    const ALICE: usize = 1;
+
+    async fn tracker() -> MessageTracker<TestMessage, InMemoryBackend<TestMessage>> {
+        MessageTracker::new(Arc::new(InMemoryBackend::<TestMessage>::new()))
+            .await
+            .expect("tracker")
+    }
+
+    /// A late ACK for an older id must not move the high-water mark backwards.
+    ///
+    /// This is the hazard re-ACKing duplicates introduces: every retransmission
+    /// now produces an acknowledgement, so an old ACK arriving after a newer
+    /// one stops being rare. `can_send` gates on `msg_id > last_acked`, so a
+    /// regressed mark re-opens a window the sender has already closed and it
+    /// re-sends messages the peer received long ago.
+    #[citadel_io::tokio::test]
+    async fn an_out_of_order_ack_does_not_regress_the_high_water_mark() {
+        let tracker = tracker().await;
+
+        tracker.update_ack(ALICE, 5).await.expect("ack 5");
+        tracker
+            .update_ack(ALICE, 2)
+            .await
+            .expect("the late duplicate");
+
+        assert!(
+            !tracker.can_send(&ALICE, &3),
+            "a stale ACK must not make an already-acknowledged id sendable again"
+        );
+        assert!(
+            tracker.can_send(&ALICE, &6),
+            "ids beyond the mark must still be sendable"
+        );
+    }
+
+    /// The guard must not block genuine progress.
+    #[citadel_io::tokio::test]
+    async fn a_newer_ack_still_advances_the_mark() {
+        let tracker = tracker().await;
+
+        tracker.update_ack(ALICE, 2).await.expect("ack 2");
+        tracker.update_ack(ALICE, 5).await.expect("ack 5");
+
+        assert!(!tracker.can_send(&ALICE, &5), "5 is acknowledged");
+        assert!(tracker.can_send(&ALICE, &6), "6 is past the mark");
     }
 }
