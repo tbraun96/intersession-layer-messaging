@@ -647,6 +647,32 @@ where
                     .contains(&(message.source_id(), message.message_id()))
                 {
                     log::warn!(target: "ism", "Skipping already delivered message: {message:?}");
+
+                    // Re-ACK, do NOT just drop it.
+                    //
+                    // A duplicate arriving means the sender never saw our first
+                    // ACK, so it is still waiting on this exact id — and the
+                    // outbound path is stop-and-wait per peer that BREAKS on the
+                    // first message it cannot send. An unacknowledged message
+                    // therefore sits at the head of that queue and blocks every
+                    // message behind it, permanently: the sender retransmits, we
+                    // recognise the duplicate, we say nothing, and it retransmits
+                    // again forever. Everything queued behind it is never sent at
+                    // all.
+                    //
+                    // That is the shape of the offline-delivery failure: the
+                    // first queued message arrives and the rest never do, while
+                    // the sender's UI shows all of them as sent. Suppressing the
+                    // ACK is what makes retransmission useless, and re-ACKing is
+                    // what makes it idempotent instead.
+                    log::info!(target: "ism", "[ILM-ACK] Re-ACKing duplicate msg_id={} to peer {}", message.message_id(), message.source_id());
+                    if let Err(e) = self
+                        .send_message_internal(self.create_ack_message(&message))
+                        .await
+                    {
+                        log::error!(target: "ism", "[ILM-ACK] FAILED to re-ACK duplicate: {e:?}");
+                    }
+
                     // Clear delivered message from backend
                     if let Err(e) = self
                         .backend
