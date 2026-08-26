@@ -532,11 +532,20 @@ where
 
         let connected_peers = &self.network.connected_peers().await;
         let local_cid = self.network.local_id();
-        log::info!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: {} messages in {} groups, {} connected peers: {:?}",
-            grouped_messages.values().map(|v| v.len()).sum::<usize>(),
-            grouped_messages.len(),
-            connected_peers.len(),
-            connected_peers);
+        // Only when there is something to report. This loop runs every 200ms
+        // per session, so unconditionally it emits 5 lines/sec/session saying
+        // "0 messages" -- which drowns the `error!`s below it in the same
+        // target. Those errors are the only record of a failed delivery, so
+        // the noise here is what makes them unreadable rather than merely
+        // verbose.
+        let pending_total: usize = grouped_messages.values().map(|v| v.len()).sum();
+        if pending_total > 0 {
+            log::info!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: {} messages in {} groups, {} connected peers: {:?}",
+                pending_total,
+                grouped_messages.len(),
+                connected_peers.len(),
+                connected_peers);
+        }
 
         // Process each peer's messages concurrently
         futures::stream::iter(grouped_messages).for_each_concurrent(None, |(peer_id, messages)|  {
