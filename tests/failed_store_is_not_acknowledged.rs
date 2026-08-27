@@ -43,10 +43,6 @@ impl FlakyStore {
     fn disarm(&self) {
         self.fail_inbound.store(false, Ordering::SeqCst);
     }
-    /// Bypasses the injection, so a test can plant a message the ILM will read.
-    async fn plant(&self, message: TestMessage) {
-        self.inner.store_inbound(message).await.expect("plant");
-    }
 }
 
 #[async_trait::async_trait]
