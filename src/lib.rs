@@ -869,8 +869,7 @@ where
                             // sender un-ACKed is what makes this recoverable.
                             log::error!(target: "ism", "Failed to store inbound message, leaving it unacknowledged so the sender retries: {e:?}");
                         } else {
-                            if let Err(e) =
-                                self.tracker.mark_received(source_id, message_id).await
+                            if let Err(e) = self.tracker.mark_received(source_id, message_id).await
                             {
                                 log::error!(target: "ism", "Failed to mark message as received: {e:?}");
                             }
