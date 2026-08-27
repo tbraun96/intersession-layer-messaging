@@ -215,6 +215,17 @@ where
         }
     }
 
+    /// Have we already accepted this message, without recording anything?
+    ///
+    /// `mark_received` answers the same question but records the answer as a
+    /// side effect, which forces callers to commit to "received" BEFORE they
+    /// have stored the message. Separating the read lets the store happen first,
+    /// so a failed store leaves nothing claiming the message arrived.
+    pub fn has_received(&self, peer_id: M::PeerId, msg_id: M::MessageId) -> bool {
+        self.received_messages.contains_key(&(peer_id, msg_id))
+            || self.has_delivered.contains(&(peer_id, msg_id))
+    }
+
     pub async fn mark_received(
         &self,
         peer_id: M::PeerId,

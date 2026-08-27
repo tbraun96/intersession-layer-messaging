@@ -837,42 +837,55 @@ where
                         }
                     }
 
-                    // Check if this is a new message
-                    match self
-                        .tracker
-                        .mark_received(msg.source_id(), msg.message_id())
-                        .await
-                    {
-                        Ok(true) => {
-                            // New message - update last_received_from for resync tracking
+                    // Store BEFORE marking received.
+                    //
+                    // This used to call `mark_received` first, which persists
+                    // "(source, id) has arrived", and only then store the
+                    // message — logging and dropping any store failure. The
+                    // sender is not ACKed here, so it retransmits; the
+                    // retransmission then matched the mark, took the duplicate
+                    // branch below, and was ACKed. The sender cleared the
+                    // message from its queue and the receiver never had it. One
+                    // failed store meant permanent, silent loss with the sender
+                    // shown "sent".
+                    //
+                    // Reading the tracker without recording lets the durable
+                    // write happen first: if it fails, nothing claims the
+                    // message arrived and the next retransmission tries again.
+                    if self.tracker.has_received(msg.source_id(), msg.message_id()) {
+                        // Already received this message, just send ACK
+                        if let Err(e) = self
+                            .send_message_internal(self.create_ack_message(&msg))
+                            .await
+                        {
+                            log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
+                        }
+                    } else {
+                        let source_id = msg.source_id();
+                        let message_id = msg.message_id();
+
+                        if let Err(e) = self.backend.store_inbound(msg).await {
+                            // Deliberately NOT marked received: leaving the
+                            // sender un-ACKed is what makes this recoverable.
+                            log::error!(target: "ism", "Failed to store inbound message, leaving it unacknowledged so the sender retries: {e:?}");
+                        } else {
+                            if let Err(e) =
+                                self.tracker.mark_received(source_id, message_id).await
+                            {
+                                log::error!(target: "ism", "Failed to mark message as received: {e:?}");
+                            }
+
                             if let Err(e) = self
                                 .tracker
-                                .update_last_received_from(msg.source_id(), msg.message_id())
+                                .update_last_received_from(source_id, message_id)
                                 .await
                             {
                                 log::error!(target: "ism", "Failed to update last_received_from: {e:?}");
                             }
 
-                            // Store and process the message
-                            if let Err(e) = self.backend.store_inbound(msg).await {
-                                log::error!(target: "ism", "Failed to store inbound message: {e:?}");
-                            }
-
                             if self.poll_inbound_tx.send(()).is_err() {
                                 log::warn!(target: "ism", "Failed to send poll signal for inbound messages");
                             }
-                        }
-                        Ok(false) => {
-                            // Already received this message, just send ACK
-                            if let Err(e) = self
-                                .send_message_internal(self.create_ack_message(&msg))
-                                .await
-                            {
-                                log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(target: "ism", "Failed to mark message as received: {e:?}");
                         }
                     }
                 }
