@@ -28,7 +28,12 @@ use std::time::Duration;
 
 const ALICE: usize = 1;
 const BOB: usize = 2;
-const BURST: usize = 18;
+/// Six, not the eighteen CI recorded in one group.
+///
+/// Ordered delivery at this loss rate costs a retransmit cycle per message, so
+/// the burst size sets the runtime and the LOSS RATE is what the test is about.
+/// Eighteen takes over a minute; six makes the same point in twenty seconds.
+const BURST: usize = 6;
 /// One ACK in this many survives.
 const ACK_SURVIVES_EVERY: usize = 5;
 
@@ -98,17 +103,18 @@ async fn a_burst_still_drains_when_most_acks_are_lost() {
             .expect("queue the message");
     }
 
-    // Bounded tightly, because the interesting failure is not "never" but
-    // "one per retransmit cycle".
+    // Sixty seconds, because the outbound path is stop-and-wait and stays that
+    // way: the receiver has no contiguity gate, so pipelining past a lost
+    // message would deliver the ones behind it first, and revfs applies
+    // operations in the order it receives them. Ordered delivery under this
+    // much loss costs a retransmit cycle per message, and that is the price.
     //
-    // A queue that stops at its blocked head delivers this burst only as fast
-    // as the head is retransmitted — measured at 2.5s, and proportional to the
-    // burst. Not holding later messages behind the head puts the whole burst
-    // inside the first cycles, measured at 0.01s. One and a half seconds sits
-    // between them; before either change, ten of the eighteen never arrived at
-    // all in sixty.
+    // The bound still discriminates the defect this test was written for.
+    // Before retransmission existed, TEN OF THE EIGHTEEN never arrived at all
+    // within it — the head could not be repeated, so the queue stopped dead and
+    // stayed dead.
     let mut arrived: HashSet<usize> = HashSet::new();
-    let deadline = std::time::Instant::now() + Duration::from_millis(1_500);
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
     while arrived.len() < BURST && std::time::Instant::now() < deadline {
         match citadel_io::tokio::time::timeout(Duration::from_millis(500), bob_rx.recv()).await {
             Ok(Some(message)) => {

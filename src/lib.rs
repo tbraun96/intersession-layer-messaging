@@ -283,14 +283,6 @@ const MAX_MAP_SIZE: usize = 1000;
 /// so this is roughly a one-second retransmit.
 const RETRANSMIT_AFTER_BLOCKS: u32 = 5;
 
-/// How many messages may leave for one peer in a single poll cycle.
-///
-/// The loop used to stop after the first, which at a 200ms interval is five
-/// messages per second per peer however much is queued. Bounded rather than
-/// unbounded so a link that is dropping packets is not answered with the whole
-/// backlog every 200ms.
-const SEND_WINDOW: u32 = 8;
-
 /// Max consecutive blocks before clearing stale state for a peer.
 ///
 /// This is the "the peer came back with fresh state" case, not packet loss --
@@ -590,35 +582,42 @@ where
                 // Sort messages by MessageId
                 let messages = messages.into_iter().sorted_by_key(|r| r.message_id()).unique_by(|r| r.message_id()).collect::<Vec<_>>();
 
-                // How many go out this cycle, and how the one at the head is
-                // treated when it cannot.
+                // One message at a time per peer, and STOP at the first that
+                // cannot go. That is what keeps the wire ordered.
                 //
-                // This loop used to send at most ONE message per cycle and stop
-                // at the first it could not send. The poll interval is 200ms,
-                // so that is a hard ceiling of five messages per second per
-                // peer -- a filesystem sync sending eighteen operations took
-                // three and a half seconds at best -- and an unacknowledged
-                // message at the head stopped everything behind it, forever,
-                // because `can_send` refuses to repeat an id it has already
-                // sent.
+                // A version of this pipelined up to eight per cycle, so a lost
+                // message no longer held up the ones behind it: the lost-ACK
+                // burst went from 2.5s to 0.01s. It was reverted, because the
+                // RECEIVER has no contiguity gate -- `process_inbound` delivers
+                // whatever is pending, sorted within the batch, and never holds
+                // message N+1 waiting for N. Stop-and-wait was what made the
+                // ordering hold, and revfs applies operations in the order it
+                // receives them: a create arriving after the write into it is a
+                // worse outcome than a slow sync.
                 //
-                // Now: the head is retransmitted on a clock when it goes
-                // unacknowledged, later messages are not held up by it, and the
-                // number in flight per cycle is bounded so a lossy link is not
-                // flooded.
-                let mut sent_this_cycle: u32 = 0;
-                let mut head_seen = false;
-
+                // The retransmission below is the part that mattered, and it
+                // stands: without it the head could not be repeated at all and
+                // the queue stopped dead.
                 'peer: for msg in messages {
-                    if sent_this_cycle >= SEND_WINDOW {
-                        break 'peer;
-                    }
                     let message_id = msg.message_id();
                     let last_acked = self.tracker.last_acked.get(&peer_id).map(|v| *v);
                     let last_sent = self.tracker.last_sent.get(&peer_id).map(|v| *v);
                     let can_send = self.tracker.can_send(&peer_id, &message_id);
 
-                    log::info!(target: "ism", "[ILM-OUTBOUND] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, can_send={can_send}, last_acked={last_acked:?}, last_sent={last_sent:?}");
+                    // `debug!`, not `info!`, and this is not a style choice.
+                    //
+                    // Before the loop stopped at the first message it could not
+                    // send, this fired once per cycle. It now considers every
+                    // queued message, so at the 200ms poll it is 5 lines per
+                    // second per QUEUED MESSAGE -- measured at 31,918 lines in a
+                    // single CI run, against 2,086 before. The same function
+                    // already carries a comment about exactly this: the noise
+                    // "drowns the `error!`s below it in the same target".
+                    //
+                    // In the WASM client each of these is a console write on the
+                    // browser's main thread, so the volume is not only
+                    // unreadable, it is spent.
+                    log::debug!(target: "ism", "[ILM-OUTBOUND] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, can_send={can_send}, last_acked={last_acked:?}, last_sent={last_sent:?}");
 
                     if can_send {
                         log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: SENDING msg_id={message_id}");
@@ -631,20 +630,10 @@ where
                             }
                             // Reset block counter on successful send
                             self.blocked_count.remove(&peer_id);
-                            sent_this_cycle += 1;
-                            continue 'peer;
+                            // Stop after sending the first message that can be sent.
+                            break 'peer;
                         }
                     } else {
-                        // Only the HEAD of the queue drives the retransmit
-                        // clock. Every id between `last_acked` and `last_sent`
-                        // is blocked, so counting all of them would advance the
-                        // counter by the queue's length per cycle and make the
-                        // clock mean nothing.
-                        if head_seen {
-                            continue 'peer;
-                        }
-                        head_seen = true;
-
                         // Increment block counter for this peer
                         let mut block_count = self.blocked_count.entry(peer_id).or_insert(0);
                         *block_count += 1;
@@ -689,15 +678,11 @@ where
                             {
                                 log::error!(target: "ism", "[ILM-RETRANSMIT] FAILED: {:?}", e);
                             }
-                            sent_this_cycle += 1;
                         }
 
-                        // Everything queued behind the head is NOT held up by
-                        // it. Skipping to a higher id used to be refused on the
-                        // grounds that it would raise `last_sent` past the
-                        // blocked message and strand it forever; the
-                        // retransmission above is what makes that safe, and the
-                        // alternative was a queue that stopped dead at its head.
+                        // Nothing behind the head goes out while the head is
+                        // unacknowledged: see the note at the top of this loop.
+                        break 'peer;
                     }
                 }
             }
