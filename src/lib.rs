@@ -640,7 +640,24 @@ where
                         let current_count = *block_count;
                         drop(block_count);
 
-                        log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK), consecutive_blocks={current_count}");
+                        // Announced ONCE, then quiet.
+                        //
+                        // Waiting for an ACK is the normal steady state of a
+                        // stop-and-wait link, and this fires every 200ms per
+                        // peer for as long as the wait lasts. A CI run of one
+                        // stuck link is hundreds of consecutive lines of it --
+                        // at `warn!`, which in the WASM client is a synchronous
+                        // console write on the browser's main thread, in a loop,
+                        // while the thing it is complaining about is starved of
+                        // that thread.
+                        //
+                        // The transition INTO blocked is the news. Everything
+                        // after it is the same news again.
+                        if current_count == 1 {
+                            log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked, awaiting ACK");
+                        } else {
+                            log::debug!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK), consecutive_blocks={current_count}");
+                        }
 
                         // Silent through fifty cycles: the peer most likely
                         // came back with fresh state, and nothing we have sent
@@ -673,7 +690,10 @@ where
                         // retransmission moves neither, and the block counter
                         // keeps running as the retransmit clock.
                         if current_count.is_multiple_of(RETRANSMIT_AFTER_BLOCKS) {
-                            log::warn!(target: "ism", "[ILM-RETRANSMIT] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, unacknowledged for {current_count} cycles");
+                            // `info!`: a retransmission is expected on a lossy
+                            // link, and at one per second per peer a `warn!`
+                            // has the same cost as the blocked line above.
+                            log::info!(target: "ism", "[ILM-RETRANSMIT] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, unacknowledged for {current_count} cycles");
                             if let Err(e) = self.send_message_internal(Payload::Message(msg)).await
                             {
                                 log::error!(target: "ism", "[ILM-RETRANSMIT] FAILED: {:?}", e);
