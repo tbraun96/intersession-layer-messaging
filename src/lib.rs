@@ -598,6 +598,19 @@ where
                 // The retransmission below is the part that mattered, and it
                 // stands: without it the head could not be repeated at all and
                 // the queue stopped dead.
+                // How many are behind the head, captured before the loop
+                // consumes them.
+                //
+                // `[ILM-OUTBOUND]` reports a total across all peers once per
+                // cycle at info!, and `[ILM-BLOCKED]` reports the head once per
+                // transition. Neither says how much is piled up behind that
+                // head for THIS peer, and that is the number which separates
+                // one lost ACK from a link that has stopped: a CI run showed
+                // one side at 12 queued, then 13, while the other sat at 1 and
+                // recovered. Reconstructing that meant diffing consecutive
+                // info lines by eye.
+                let queued: usize = messages.len();
+
                 'peer: for msg in messages {
                     let message_id = msg.message_id();
                     let last_acked = self.tracker.last_acked.get(&peer_id).map(|v| *v);
@@ -654,9 +667,9 @@ where
                         // The transition INTO blocked is the news. Everything
                         // after it is the same news again.
                         if current_count == 1 {
-                            log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked, awaiting ACK");
+                            log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked, awaiting ACK, {queued} queued for this peer");
                         } else {
-                            log::debug!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK), consecutive_blocks={current_count}");
+                            log::debug!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK), consecutive_blocks={current_count}, {queued} queued");
                         }
 
                         // Silent through fifty cycles: the peer most likely
@@ -665,7 +678,7 @@ where
                         // because at that point sending the same message again
                         // is the thing that has already failed fifty times.
                         if current_count >= MAX_CONSECUTIVE_BLOCKS {
-                            log::warn!(target: "ism", "[ILM-BLOCKED-RECOVERY] CID {local_cid} -> peer {peer_id}: clearing stale state after {current_count} consecutive blocks");
+                            log::warn!(target: "ism", "[ILM-BLOCKED-RECOVERY] CID {local_cid} -> peer {peer_id}: clearing stale state after {current_count} consecutive blocks, {queued} queued for this peer");
                             self.tracker.last_sent.remove(&peer_id);
                             self.tracker.last_acked.remove(&peer_id);
                             if let Err(e) = self.tracker.sync_backend().await {
