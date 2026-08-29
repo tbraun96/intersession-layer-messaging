@@ -11,6 +11,17 @@ pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     pub has_delivered: DashSet<(M::PeerId, M::MessageId)>,
     /// Tracks the highest message ID received FROM each peer (for resync)
     pub last_received_from: DashMap<M::PeerId, M::MessageId>,
+    /// The highest id delivered from each peer with NO GAP beneath it.
+    ///
+    /// `last_received_from` is the highest id that ARRIVED, which is a
+    /// different thing the moment more than one message is in flight: 5 can
+    /// arrive while 4 is still on the wire. Acknowledgement is cumulative --
+    /// `update_ack` keeps the maximum and discards anything lower -- so an ACK
+    /// for 5 tells the sender that 4 is done too, and it will never send 4
+    /// again. Acknowledging out of order is silent, permanent loss.
+    ///
+    /// This is the id it is safe to acknowledge up to.
+    pub last_delivered: DashMap<M::PeerId, M::MessageId>,
     pub backend: Arc<B>,
 }
 
@@ -27,6 +38,7 @@ where
             received_messages: Default::default(),
             has_delivered: Default::default(),
             last_received_from: Default::default(),
+            last_delivered: Default::default(),
             backend,
         };
 
@@ -38,6 +50,7 @@ where
             "next_unique_id",
             "received_messages",
             "last_received_from",
+            "last_delivered",
         ];
         let results = tracker.backend.load_values_batched(&keys).await?;
 
@@ -70,6 +83,53 @@ where
             if let Ok(map) = bincode2::deserialize(last_received_bytes) {
                 tracker.last_received_from = map;
             }
+        }
+
+        if let Some(Some(last_delivered_bytes)) = results.get(5) {
+            if let Ok(map) = bincode2::deserialize(last_delivered_bytes) {
+                tracker.last_delivered = map;
+            }
+        }
+
+        // A store written before this field existed has no `last_delivered`,
+        // and the frontier decides whether an arriving message may be
+        // delivered. Getting the seed wrong is not a stall, it is loss: the
+        // frontier is also the highest id it is safe to acknowledge, and
+        // acknowledgement is cumulative.
+        //
+        // `last_received_from` looks like the answer -- until this change one
+        // message was in flight per peer, so what arrived was delivered in
+        // order -- and it is wrong. RECEIVED is not DELIVERED. A message whose
+        // local delivery failed (a closed channel, a full queue) stays pending
+        // and is retried, while `last_received_from` has already moved past it.
+        // Seeding from it claimed such a message as delivered and dropped it;
+        // `test_hard_disconnect_queued_message_delivery` catches exactly that,
+        // reporting [1, 2, 3, 4] where [0, 1, 2, 3, 4] was expected.
+        //
+        // So the seed is taken only where it is provably true: peers with
+        // NOTHING still pending inbound. There, everything received was
+        // delivered by definition. Where something is pending, the frontier is
+        // left unset and the lowest pending id starts the run -- which is the
+        // right answer for an upgrade, because under one-in-flight the lowest
+        // undelivered id is exactly where the old build stopped.
+        let still_pending = tracker
+            .backend
+            .get_pending_inbound()
+            .await
+            .unwrap_or_default();
+        let mut has_pending: std::collections::HashSet<M::PeerId> =
+            std::collections::HashSet::new();
+        for message in &still_pending {
+            has_pending.insert(message.source_id());
+        }
+        for entry in tracker.last_received_from.iter() {
+            if has_pending.contains(entry.key()) {
+                continue;
+            }
+            tracker
+                .last_delivered
+                .entry(*entry.key())
+                .or_insert(*entry.value());
         }
 
         // Handle reconnection inconsistency: if last_sent has entries but last_acked
@@ -213,6 +273,105 @@ where
             (Some(last_acked), Some(last_sent)) => *msg_id > *last_acked && *msg_id > *last_sent,
             (Some(last_acked), None) => *msg_id > *last_acked,
         }
+    }
+
+    /// Whether this message is the next one deliverable from that peer.
+    ///
+    /// Delivery has to be gapless because acknowledgement is cumulative: an ACK
+    /// for 5 retires 1..5 at the sender. Delivering 5 while 4 is still missing
+    /// would acknowledge 4 and lose it.
+    ///
+    /// `None` for a peer means nothing has been delivered yet, and then the
+    /// lowest id waiting from that peer starts the run — `first_pending`.
+    ///
+    /// It cannot guess zero. `send_raw_message` lets a caller choose the id, and
+    /// a sender resuming with a persisted `next_unique_id` against a receiver
+    /// whose store was cleared begins wherever it left off. Demanding zero
+    /// would hold every such message for ever.
+    ///
+    /// Accepting the lowest pending is only safe because a sender may not open
+    /// its window until it has an acknowledgement from this peer — see
+    /// SEND_WINDOW. Until then exactly one message is in flight, so "the lowest
+    /// pending" and "the start of the run" are the same id and no gap can hide
+    /// beneath it. Were the window open first, losing the true first message
+    /// would make the second one look like the start, and acknowledging it
+    /// would cumulatively retire the one that was lost.
+    pub fn is_next_deliverable(
+        &self,
+        peer_id: &M::PeerId,
+        msg_id: &M::MessageId,
+        first_pending: bool,
+    ) -> bool {
+        match self.last_delivered.get(peer_id) {
+            Some(frontier) => *msg_id == *frontier + M::MessageId::one(),
+            None => first_pending,
+        }
+    }
+
+    /// Whether a held message has been waiting longer than the gap beneath it
+    /// can reasonably take to arrive.
+    ///
+    /// A permanent hold is a worse failure than an out-of-order delivery, and
+    /// nothing else can break one: the sender retransmits its head and, after
+    /// `MAX_CONSECUTIVE_BLOCKS`, clears its state and starts the same queue
+    /// again -- so if the missing id genuinely cannot be produced, both sides
+    /// wait for ever.
+    ///
+    /// `get_next_id` numbers messages densely per peer, so this should never
+    /// fire for a stream built with `send_to`. It exists because
+    /// `send_raw_message` is public and takes whatever id it is given, and
+    /// because a future defect that opens a gap should cost a warning and a
+    /// delay rather than a conversation that never moves again.
+    ///
+    /// Uses the receipt timestamp `mark_received` already records, so nothing
+    /// new has to be tracked.
+    pub fn held_too_long(
+        &self,
+        peer_id: &M::PeerId,
+        msg_id: &M::MessageId,
+        patience_secs: u64,
+    ) -> bool {
+        match self.received_messages.get(&(*peer_id, *msg_id)) {
+            Some(received_at) => {
+                platform_timestamp_secs().saturating_sub(*received_at) >= patience_secs
+            }
+            None => false,
+        }
+    }
+
+    /// Whether acknowledging this id would claim anything not yet delivered.
+    ///
+    /// The duplicate-ACK paths need this as much as the delivery path does: a
+    /// message that arrives twice while a lower one is missing must not be
+    /// acknowledged just because it is a duplicate.
+    pub fn safe_to_ack(&self, peer_id: &M::PeerId, msg_id: &M::MessageId) -> bool {
+        match self.last_delivered.get(peer_id) {
+            Some(frontier) => *msg_id <= *frontier,
+            None => false,
+        }
+    }
+
+    /// Record that everything up to and including `msg_id` has been delivered.
+    pub async fn mark_delivered(
+        &self,
+        peer_id: M::PeerId,
+        msg_id: M::MessageId,
+    ) -> Result<(), BackendError<M>> {
+        let stale = self
+            .last_delivered
+            .get(&peer_id)
+            .map(|current| msg_id <= *current)
+            .unwrap_or(false);
+        if stale {
+            return Ok(());
+        }
+        self.last_delivered.insert(peer_id, msg_id);
+        self.backend
+            .store_value(
+                "last_delivered",
+                &bincode2::serialize(&self.last_delivered).unwrap(),
+            )
+            .await
     }
 
     /// Have we already accepted this message, without recording anything?

@@ -281,6 +281,39 @@ const MAX_MAP_SIZE: usize = 1000;
 /// Counted in cycles rather than elapsed time because this crate compiles to
 /// wasm32, where `Instant::now` is not available. The poll interval is 200ms,
 /// so this is roughly a one-second retransmit.
+/// How many messages may be in flight to one peer at a time.
+///
+/// This was one, and one is what a directory sync costs dearly. The outbound
+/// path sent the lowest unsent id and stopped, so the whole queue waited on the
+/// head's acknowledgement. Measured on the crate's own in-memory network with
+/// four ACKs in five dropped: **2.7 seconds per message**. CI's file-manager
+/// run had 96 queued behind one such head, which is over four minutes for a
+/// sync the test gives up on long before.
+///
+/// A clean link never noticed, because there the head is acknowledged in
+/// microseconds -- 96 messages drain in 34ms. The cost is entirely a
+/// loss-recovery cost, and stop-and-wait pays it once per message rather than
+/// once per window.
+///
+/// Eight, not more: acknowledgement is cumulative, so one surviving ACK retires
+/// the whole window, and at four-in-five loss the chance that at least one of
+/// eight survives is 83%. Larger windows buy little and put more unacknowledged
+/// data on a link that is already dropping things.
+///
+/// Setting this to 1 restores the previous behaviour exactly, and the tests
+/// that pin ordering and non-loss pass either way.
+const SEND_WINDOW: usize = 8;
+
+/// How long a message may be held waiting for the gap beneath it to fill.
+///
+/// Generous on purpose: the sender retransmits its head every
+/// `RETRANSMIT_AFTER_BLOCKS` cycles (about a second) and clears its state
+/// entirely after `MAX_CONSECUTIVE_BLOCKS` (about ten), so a gap that can be
+/// filled is filled long before this. Passing it means the missing id is not
+/// coming, and a conversation that never moves again is a worse outcome than
+/// one delivery out of order announced at `warn!`.
+const GAP_PATIENCE_SECS: u64 = 20;
+
 const RETRANSMIT_AFTER_BLOCKS: u32 = 5;
 
 /// Max consecutive blocks before clearing stale state for a peer.
@@ -611,6 +644,40 @@ where
                 // info lines by eye.
                 let queued: usize = messages.len();
 
+                // Room in the window: how many more may go out before the
+                // oldest unacknowledged one has to come back.
+                //
+                // "In flight" is every id already sent and not yet acked --
+                // above `last_acked`, at or below `last_sent`. Recomputed from
+                // the queue each cycle rather than counted incrementally, so a
+                // dropped or re-delivered message cannot leave the count
+                // drifting from what is actually outstanding.
+                let acked_upto = self.tracker.last_acked.get(&peer_id).map(|v| *v);
+                let sent_upto = self.tracker.last_sent.get(&peer_id).map(|v| *v);
+                let outstanding: usize = match sent_upto {
+                    None => 0,
+                    Some(sent) => messages
+                        .iter()
+                        .filter(|m| {
+                            let id = m.message_id();
+                            id <= sent && acked_upto.map(|a| id > a).unwrap_or(true)
+                        })
+                        .count(),
+                };
+                // Closed until this peer has acknowledged something.
+                //
+                // The receiver takes the lowest id waiting from a peer as the
+                // start of the run when it has delivered nothing yet, and that
+                // is only sound while one message is in flight: with the window
+                // open from the start, losing the true first message would make
+                // the second look like the beginning, and acknowledging it would
+                // cumulatively retire the one that was lost.
+                let window: usize = if acked_upto.is_some() { SEND_WINDOW } else { 1 };
+                let mut budget: usize = window.saturating_sub(outstanding);
+                // The head does the block accounting; the messages behind it
+                // are not "blocked", they are simply not its turn.
+                let mut head_accounted: bool = false;
+
                 'peer: for msg in messages {
                     let message_id = msg.message_id();
                     let last_acked = self.tracker.last_acked.get(&peer_id).map(|v| *v);
@@ -633,9 +700,19 @@ where
                     log::debug!(target: "ism", "[ILM-OUTBOUND] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, can_send={can_send}, last_acked={last_acked:?}, last_sent={last_sent:?}");
 
                     if can_send {
+                        // Window full: the rest wait for an acknowledgement,
+                        // not for a timer.
+                        if budget == 0 {
+                            log::debug!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: window full at {window}, {queued} queued");
+                            break 'peer;
+                        }
                         log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: SENDING msg_id={message_id}");
                         if let Err(e) = self.send_message_internal(Payload::Message(msg)).await {
                             log::error!(target: "ism", "[ILM-SEND] FAILED: {:?}", e);
+                            // The wire refused it. Trying the next id would put
+                            // a gap on a link that just failed, so stop here and
+                            // let the next cycle retry this same id.
+                            break 'peer;
                         } else {
                             log::info!(target: "ism", "[ILM-SEND] SUCCESS: msg_id={message_id}");
                             if let Err(err) = self.tracker.mark_sent(peer_id, message_id).await {
@@ -643,10 +720,16 @@ where
                             }
                             // Reset block counter on successful send
                             self.blocked_count.remove(&peer_id);
-                            // Stop after sending the first message that can be sent.
-                            break 'peer;
+                            budget -= 1;
+                            continue 'peer;
                         }
+                    } else if head_accounted {
+                        // Already sent and awaiting an ACK, and not the head, so
+                        // there is nothing to count and nothing to retransmit.
+                        // Keep walking: a sendable id may be behind it.
+                        continue 'peer;
                     } else {
+                        head_accounted = true;
                         // Increment block counter for this peer
                         let mut block_count = self.blocked_count.entry(peer_id).or_insert(0);
                         *block_count += 1;
@@ -713,9 +796,13 @@ where
                             }
                         }
 
-                        // Nothing behind the head goes out while the head is
-                        // unacknowledged: see the note at the top of this loop.
-                        break 'peer;
+                        // The head stays unacknowledged, but the window does
+                        // not stop at it. Everything behind it that is still
+                        // unsent and inside the window goes out on this same
+                        // cycle -- which is the whole point: one surviving
+                        // cumulative ACK then retires the head and the run
+                        // behind it together.
+                        continue 'peer;
                     }
                 }
             }
@@ -755,77 +842,131 @@ where
             .collect();
 
         log::trace!(target: "ism", "~~~Processing inbound messages: {pending_messages:?}");
+
+        // Grouped by sender, ascending, because deliverability is per peer.
+        //
+        // The batch above is sorted by message id alone, and ids are per-peer
+        // counters, so two peers' streams interleave in it. Walking that order
+        // and asking "is this the next id from its sender" would answer for
+        // whichever sender happened to sort adjacent.
+        let mut by_peer: std::collections::HashMap<M::PeerId, Vec<M>> =
+            std::collections::HashMap::new();
+        for message in pending_messages {
+            by_peer
+                .entry(message.source_id())
+                .or_default()
+                .push(message);
+        }
+        for group in by_peer.values_mut() {
+            group.sort_by_key(|m| m.message_id());
+        }
+
         if let Some(delivery) = self.local_delivery.lock().await.as_ref() {
-            for message in pending_messages {
-                if self
-                    .tracker
-                    .has_delivered
-                    .contains(&(message.source_id(), message.message_id()))
-                {
-                    log::warn!(target: "ism", "Skipping already delivered message: {message:?}");
+            for (peer_id, group) in by_peer {
+                for (position, message) in group.into_iter().enumerate() {
+                    let message_id = message.message_id();
+                    let first_pending = position == 0;
 
-                    // Re-ACK, do NOT just drop it.
+                    // Already delivered, in this process or a previous one.
                     //
-                    // A duplicate arriving means the sender never saw our first
-                    // ACK, so it is still waiting on this exact id — and the
-                    // outbound path is stop-and-wait per peer that BREAKS on the
-                    // first message it cannot send. An unacknowledged message
-                    // therefore sits at the head of that queue and blocks every
-                    // message behind it, permanently: the sender retransmits, we
-                    // recognise the duplicate, we say nothing, and it retransmits
-                    // again forever. Everything queued behind it is never sent at
-                    // all.
-                    //
-                    // That is the shape of the offline-delivery failure: the
-                    // first queued message arrives and the rest never do, while
-                    // the sender's UI shows all of them as sent. Suppressing the
-                    // ACK is what makes retransmission useless, and re-ACKing is
-                    // what makes it idempotent instead.
-                    log::info!(target: "ism", "[ILM-ACK] Re-ACKing duplicate msg_id={} to peer {}", message.message_id(), message.source_id());
-                    if let Err(e) = self
-                        .send_message_internal(self.create_ack_message(&message))
-                        .await
-                    {
-                        log::error!(target: "ism", "[ILM-ACK] FAILED to re-ACK duplicate: {e:?}");
-                    }
-
-                    // Clear delivered message from backend
-                    if let Err(e) = self
-                        .backend
-                        .clear_message_inbound(message.source_id(), message.message_id())
-                        .await
-                    {
-                        log::error!(target: "ism", "Failed to clear delivered message: {e:?}");
-                    }
-                    continue;
-                }
-
-                match delivery.deliver(message.clone()).await {
-                    Ok(()) => {
-                        log::info!(target: "ism", "[ILM-INBOUND] Delivered msg_id={} from peer {}", message.message_id(), message.source_id());
-                        self.tracker
-                            .has_delivered
-                            .insert((message.source_id(), message.message_id()));
-                        // Create and send ACK
-                        log::info!(target: "ism", "[ILM-ACK] Sending ACK for msg_id={} to peer {}", message.message_id(), message.source_id());
+                    // Asked of the DURABLE frontier rather than the in-memory
+                    // `has_delivered` set, because that set does not survive a
+                    // restart: after one, a retransmission of an old message
+                    // would fall through to the gap check below, be held as
+                    // "not next", never acknowledged, and retransmitted for as
+                    // long as the process lived.
+                    if self.tracker.safe_to_ack(&peer_id, &message_id) {
+                        // Re-ACK, do NOT just drop it.
+                        //
+                        // A duplicate arriving means the sender never saw our
+                        // first ACK, so it is still waiting on this exact id.
+                        // Suppressing the ACK is what makes retransmission
+                        // useless; re-ACKing is what makes it idempotent.
+                        log::info!(target: "ism", "[ILM-ACK] Re-ACKing already-delivered msg_id={message_id} to peer {peer_id}");
                         if let Err(e) = self
                             .send_message_internal(self.create_ack_message(&message))
                             .await
                         {
-                            log::error!(target: "ism", "[ILM-ACK] FAILED to send ACK: {e:?}");
+                            log::error!(target: "ism", "[ILM-ACK] FAILED to re-ACK duplicate: {e:?}");
                         }
-
-                        // Clear delivered message from backend
                         if let Err(e) = self
                             .backend
-                            .clear_message_inbound(message.source_id(), message.message_id())
+                            .clear_message_inbound(peer_id, message_id)
                             .await
                         {
                             log::error!(target: "ism", "Failed to clear delivered message: {e:?}");
                         }
+                        continue;
                     }
-                    Err(e) => {
-                        log::error!(target: "ism", "Failed to deliver message {message:?}: {e:?}");
+
+                    // A gap. Hold it, and hold everything behind it.
+                    //
+                    // More than one message is in flight per peer now, so 5 can
+                    // arrive while 4 is still on the wire. Delivering 5 would be
+                    // out of order — revfs applies operations in the order it
+                    // receives them, and a write landing before the create it
+                    // belongs to is worse than a slow sync. Worse still, the ACK
+                    // that follows delivery is CUMULATIVE: acknowledging 5
+                    // retires 4 at the sender, which will then never send it
+                    // again. That is silent, permanent loss.
+                    //
+                    // Held, not dropped: it stays in the backend and is
+                    // delivered on the cycle after the gap fills. The group is
+                    // ascending, so nothing behind this one is contiguous
+                    // either.
+                    if !self
+                        .tracker
+                        .is_next_deliverable(&peer_id, &message_id, first_pending)
+                    {
+                        if self
+                            .tracker
+                            .held_too_long(&peer_id, &message_id, GAP_PATIENCE_SECS)
+                        {
+                            // Loud, because it is a real loss: advancing the
+                            // frontier to this id acknowledges the gap beneath
+                            // it, and the sender will never send it again.
+                            log::warn!(target: "ism", "[ILM-INBOUND] Delivering msg_id={message_id} from peer {peer_id} out of order after {GAP_PATIENCE_SECS}s: the id beneath it never arrived");
+                        } else {
+                            log::debug!(target: "ism", "[ILM-INBOUND] Holding msg_id={message_id} from peer {peer_id}: waiting for the gap beneath it");
+                            break;
+                        }
+                    }
+
+                    match delivery.deliver(message.clone()).await {
+                        Ok(()) => {
+                            log::info!(target: "ism", "[ILM-INBOUND] Delivered msg_id={message_id} from peer {peer_id}");
+                            self.tracker.has_delivered.insert((peer_id, message_id));
+
+                            // BEFORE the ACK. The ACK says "everything up to
+                            // here is delivered", and the frontier is what makes
+                            // that true.
+                            if let Err(e) = self.tracker.mark_delivered(peer_id, message_id).await {
+                                log::error!(target: "ism", "Failed to advance the delivery frontier: {e:?}");
+                            }
+
+                            log::info!(target: "ism", "[ILM-ACK] Sending ACK for msg_id={message_id} to peer {peer_id}");
+                            if let Err(e) = self
+                                .send_message_internal(self.create_ack_message(&message))
+                                .await
+                            {
+                                log::error!(target: "ism", "[ILM-ACK] FAILED to send ACK: {e:?}");
+                            }
+
+                            if let Err(e) = self
+                                .backend
+                                .clear_message_inbound(peer_id, message_id)
+                                .await
+                            {
+                                log::error!(target: "ism", "Failed to clear delivered message: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            // Left in the backend and the frontier not advanced,
+                            // so the next cycle tries this same id again rather
+                            // than stepping over it.
+                            log::error!(target: "ism", "Failed to deliver message {message:?}: {e:?}");
+                            break;
+                        }
                     }
                 }
             }
@@ -933,12 +1074,23 @@ where
                         if msgs.iter().any(|m| {
                             m.message_id() == msg.message_id() && m.source_id() == msg.source_id()
                         }) {
-                            log::warn!(target: "ism", "Received duplicate message, sending ACK");
-                            if let Err(e) = self
-                                .send_message_internal(self.create_ack_message(&msg))
-                                .await
+                            // Only up to the delivery frontier. Acknowledgement
+                            // is cumulative, so an ACK for an id above it would
+                            // retire the gap beneath it at the sender and lose
+                            // whatever is still missing.
+                            if self
+                                .tracker
+                                .safe_to_ack(&msg.source_id(), &msg.message_id())
                             {
-                                log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
+                                log::warn!(target: "ism", "Received duplicate message, sending ACK");
+                                if let Err(e) = self
+                                    .send_message_internal(self.create_ack_message(&msg))
+                                    .await
+                                {
+                                    log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
+                                }
+                            } else {
+                                log::debug!(target: "ism", "Duplicate msg_id={} from {} is above the delivery frontier; not ACKing", msg.message_id(), msg.source_id());
                             }
                             return;
                         }
@@ -960,12 +1112,29 @@ where
                     // write happen first: if it fails, nothing claims the
                     // message arrived and the next retransmission tries again.
                     if self.tracker.has_received(msg.source_id(), msg.message_id()) {
-                        // Already received this message, just send ACK
-                        if let Err(e) = self
-                            .send_message_internal(self.create_ack_message(&msg))
-                            .await
+                        // Received before -- but "received" and "delivered" are
+                        // no longer the same thing. A message held behind a gap
+                        // has been received and stored and must NOT be
+                        // acknowledged: the ACK is cumulative and would retire
+                        // the missing id beneath it.
+                        if self
+                            .tracker
+                            .safe_to_ack(&msg.source_id(), &msg.message_id())
                         {
-                            log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
+                            if let Err(e) = self
+                                .send_message_internal(self.create_ack_message(&msg))
+                                .await
+                            {
+                                log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
+                            }
+                        } else {
+                            // Nudge the inbound loop instead: the gap this one
+                            // is waiting behind may have just been filled by the
+                            // message that arrived before it.
+                            log::debug!(target: "ism", "Held msg_id={} from {} re-arrived; re-examining the inbound queue", msg.message_id(), msg.source_id());
+                            if self.poll_inbound_tx.send(()).is_err() {
+                                log::warn!(target: "ism", "Failed to send poll signal for inbound messages");
+                            }
                         }
                     } else {
                         let source_id = msg.source_id();

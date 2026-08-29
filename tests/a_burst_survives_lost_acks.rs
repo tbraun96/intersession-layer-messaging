@@ -28,12 +28,19 @@ use std::time::Duration;
 
 const ALICE: usize = 1;
 const BOB: usize = 2;
-/// Six, not the eighteen CI recorded in one group.
+/// Sixty, which used to be impossible here.
 ///
-/// Ordered delivery at this loss rate costs a retransmit cycle per message, so
-/// the burst size sets the runtime and the LOSS RATE is what the test is about.
-/// Eighteen takes over a minute; six makes the same point in twenty seconds.
-const BURST: usize = 6;
+/// This was six, with a note explaining why: "ordered delivery at this loss
+/// rate costs a retransmit cycle per message, so the burst size sets the
+/// runtime -- eighteen takes over a minute; six makes the same point in twenty
+/// seconds." That was an accurate description of stop-and-wait. Six messages
+/// took 16.3 seconds.
+///
+/// With `SEND_WINDOW` the cost is a round trip per WINDOW rather than per
+/// message, and acknowledgement is cumulative, so one ACK surviving out of
+/// eight retires the whole window. Sixty at the same loss rate now runs in
+/// under a second, and the burst size no longer sets the runtime.
+const BURST: usize = 60;
 /// One ACK in this many survives.
 const ACK_SURVIVES_EVERY: usize = 5;
 

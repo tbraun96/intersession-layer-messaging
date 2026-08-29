@@ -2001,18 +2001,25 @@ mod tests {
                 .unwrap();
 
             // Now send a new message - without the fix, this would be blocked forever
+            //
+            // Id 1, not 10. The receiver delivers a peer's ids in contiguous
+            // order -- it must, because acknowledgement is cumulative and an ACK
+            // for 10 would retire 1..9 at the sender -- and phase one delivered
+            // id 0. A jump to 10 is a stream `get_next_id` cannot produce, and
+            // it was incidental to what this test is about: that a stale
+            // `last_sent` no longer blocks the NEXT message for ever.
             let new_msg = TestMessage {
                 source_id: 1,
                 destination_id: 2,
-                message_id: 10,
-                contents: vec![10],
+                message_id: 1,
+                contents: vec![1],
             };
             message_system1.send_raw_message(new_msg).await.unwrap();
 
             // Verify message is delivered (proves can_send returned true)
             match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
                 Ok(Some(received)) => {
-                    assert_eq!(received.message_id(), 10);
+                    assert_eq!(received.message_id(), 1);
                     log::info!(
                         "[TEST] SUCCESS: Message delivered after stale last_sent was cleared"
                     );
