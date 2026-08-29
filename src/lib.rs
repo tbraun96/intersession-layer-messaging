@@ -265,8 +265,40 @@ pub trait Backend<M: MessageMetadata>: Send + Sync {
 
 const MAX_MAP_SIZE: usize = 1000;
 
-/// Max consecutive blocks before clearing stale state for a peer
-const MAX_CONSECUTIVE_BLOCKS: u32 = 10;
+/// Poll cycles a head message waits, unacknowledged, before it is sent again.
+///
+/// The outbound path sends the LOWEST unsent id and breaks on the first message
+/// it cannot send, and `can_send` refuses anything whose id is not greater than
+/// `last_sent` -- so the message at the head cannot be retransmitted through
+/// the normal route at all. Before this constant existed the only thing that
+/// ever re-sent it was the emergency branch below, ten cycles later, which also
+/// discarded `last_acked`: the protocol depended on its own recovery path for
+/// ordinary packet loss, and everything queued behind the head waited for it.
+///
+/// Measured, with four ACKs in five dropped: ten of eighteen messages never
+/// arrived in sixty seconds (`a_burst_survives_lost_acks`).
+///
+/// Counted in cycles rather than elapsed time because this crate compiles to
+/// wasm32, where `Instant::now` is not available. The poll interval is 200ms,
+/// so this is roughly a one-second retransmit.
+const RETRANSMIT_AFTER_BLOCKS: u32 = 5;
+
+/// How many messages may leave for one peer in a single poll cycle.
+///
+/// The loop used to stop after the first, which at a 200ms interval is five
+/// messages per second per peer however much is queued. Bounded rather than
+/// unbounded so a link that is dropping packets is not answered with the whole
+/// backlog every 200ms.
+const SEND_WINDOW: u32 = 8;
+
+/// Max consecutive blocks before clearing stale state for a peer.
+///
+/// This is the "the peer came back with fresh state" case, not packet loss --
+/// retransmission above handles that. It throws away `last_acked`, so every
+/// message the peer already confirmed can be sent again; that is a reasonable
+/// thing to do once a link has been silent through fifty cycles and a wrong
+/// thing to do as a routine response to a dropped ACK.
+const MAX_CONSECUTIVE_BLOCKS: u32 = 50;
 
 pub struct ILM<M, B, L, N>
 where
@@ -558,8 +590,29 @@ where
                 // Sort messages by MessageId
                 let messages = messages.into_iter().sorted_by_key(|r| r.message_id()).unique_by(|r| r.message_id()).collect::<Vec<_>>();
 
-                // Find the first message we can send based on ACKs
+                // How many go out this cycle, and how the one at the head is
+                // treated when it cannot.
+                //
+                // This loop used to send at most ONE message per cycle and stop
+                // at the first it could not send. The poll interval is 200ms,
+                // so that is a hard ceiling of five messages per second per
+                // peer -- a filesystem sync sending eighteen operations took
+                // three and a half seconds at best -- and an unacknowledged
+                // message at the head stopped everything behind it, forever,
+                // because `can_send` refuses to repeat an id it has already
+                // sent.
+                //
+                // Now: the head is retransmitted on a clock when it goes
+                // unacknowledged, later messages are not held up by it, and the
+                // number in flight per cycle is bounded so a lossy link is not
+                // flooded.
+                let mut sent_this_cycle: u32 = 0;
+                let mut head_seen = false;
+
                 'peer: for msg in messages {
+                    if sent_this_cycle >= SEND_WINDOW {
+                        break 'peer;
+                    }
                     let message_id = msg.message_id();
                     let last_acked = self.tracker.last_acked.get(&peer_id).map(|v| *v);
                     let last_sent = self.tracker.last_sent.get(&peer_id).map(|v| *v);
@@ -578,10 +631,20 @@ where
                             }
                             // Reset block counter on successful send
                             self.blocked_count.remove(&peer_id);
-                            // Stop after sending the first message that can be sent
-                            break 'peer;
+                            sent_this_cycle += 1;
+                            continue 'peer;
                         }
                     } else {
+                        // Only the HEAD of the queue drives the retransmit
+                        // clock. Every id between `last_acked` and `last_sent`
+                        // is blocked, so counting all of them would advance the
+                        // counter by the queue's length per cycle and make the
+                        // clock mean nothing.
+                        if head_seen {
+                            continue 'peer;
+                        }
+                        head_seen = true;
+
                         // Increment block counter for this peer
                         let mut block_count = self.blocked_count.entry(peer_id).or_insert(0);
                         *block_count += 1;
@@ -590,8 +653,11 @@ where
 
                         log::warn!(target: "ism", "[ILM-BLOCKED] CID {local_cid} -> peer {peer_id}: msg_id={message_id} blocked (awaiting ACK), consecutive_blocks={current_count}");
 
-                        // If blocked too many times, peer likely reconnected with fresh state
-                        // Clear stale tracking to allow message delivery
+                        // Silent through fifty cycles: the peer most likely
+                        // came back with fresh state, and nothing we have sent
+                        // means anything to it. Checked BEFORE retransmission,
+                        // because at that point sending the same message again
+                        // is the thing that has already failed fifty times.
                         if current_count >= MAX_CONSECUTIVE_BLOCKS {
                             log::warn!(target: "ism", "[ILM-BLOCKED-RECOVERY] CID {local_cid} -> peer {peer_id}: clearing stale state after {current_count} consecutive blocks");
                             self.tracker.last_sent.remove(&peer_id);
@@ -600,15 +666,38 @@ where
                                 log::error!(target: "ism", "[ILM-BLOCKED-RECOVERY] Failed to sync backend: {:?}", e);
                             }
                             self.blocked_count.remove(&peer_id);
-                            // Break and let the next poll cycle retry from the beginning
-                            // with clean state. Using `continue 'peer` here would skip to
-                            // the next message (higher ID), setting last_sent higher than
-                            // the blocked message's ID and permanently preventing it from
-                            // satisfying msg_id > last_sent.
+                            // Let the next cycle start over with clean state.
                             break 'peer;
                         }
-                        // If we can't send the current message, stop processing this group
-                        break;
+
+                        // Send it again.
+                        //
+                        // `can_send` is false because `msg_id > last_sent` is
+                        // false -- this message has been sent and not
+                        // acknowledged, which is precisely the case that calls
+                        // for a retransmission rather than for waiting. The
+                        // receiver de-duplicates and acknowledges again (see
+                        // the `duplicate_reack` test), so a repeat costs one
+                        // packet and never a duplicate delivery.
+                        //
+                        // `last_sent` and `last_acked` are both left alone: a
+                        // retransmission moves neither, and the block counter
+                        // keeps running as the retransmit clock.
+                        if current_count.is_multiple_of(RETRANSMIT_AFTER_BLOCKS) {
+                            log::warn!(target: "ism", "[ILM-RETRANSMIT] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, unacknowledged for {current_count} cycles");
+                            if let Err(e) = self.send_message_internal(Payload::Message(msg)).await
+                            {
+                                log::error!(target: "ism", "[ILM-RETRANSMIT] FAILED: {:?}", e);
+                            }
+                            sent_this_cycle += 1;
+                        }
+
+                        // Everything queued behind the head is NOT held up by
+                        // it. Skipping to a higher id used to be refused on the
+                        // grounds that it would raise `last_sent` past the
+                        // blocked message and strand it forever; the
+                        // retransmission above is what makes that safe, and the
+                        // alternative was a queue that stopped dead at its head.
                     }
                 }
             }
