@@ -895,6 +895,29 @@ where
                     // "not next", never acknowledged, and retransmitted for as
                     // long as the process lived.
                     if self.tracker.safe_to_ack(&peer_id, &message_id) {
+                        // Unless it is one the frontier was advanced PAST
+                        // without ever delivering. That id is below the
+                        // frontier and has never reached the application, so
+                        // treating it as a duplicate is what turned the
+                        // gap-patience delivery into permanent loss. Deliver it
+                        // late -- ordering was already broken by the delivery
+                        // that skipped it, and a message out of order beats a
+                        // message gone.
+                        if self.tracker.was_skipped(&peer_id, &message_id) {
+                            log::warn!(target: "ism", "[ILM-INBOUND] Late delivery of skipped msg_id={message_id} from peer {peer_id}");
+                            // `delivery` is the binding from the enclosing
+                            // `if let` -- re-locking `local_delivery` here
+                            // would deadlock on a lock this scope already holds.
+                            if let Err(e) = delivery.deliver(message.clone()).await {
+                                // Left in the backend and still marked skipped,
+                                // so the next cycle tries again.
+                                log::error!(target: "ism", "[ILM-INBOUND] Failed to deliver late msg_id={message_id}: {e:?}");
+                                continue;
+                            }
+                            self.tracker.has_delivered.insert((peer_id, message_id));
+                            self.tracker.clear_skipped(&peer_id, &message_id);
+                        }
+
                         // Re-ACK, do NOT just drop it.
                         //
                         // A duplicate arriving means the sender never saw our
@@ -941,9 +964,19 @@ where
                             .tracker
                             .held_too_long(&peer_id, &message_id, GAP_PATIENCE_SECS)
                         {
-                            // Loud, because it is a real loss: advancing the
-                            // frontier to this id acknowledges the gap beneath
-                            // it, and the sender will never send it again.
+                            // Loud, because advancing the frontier to this id
+                            // acknowledges the gap beneath it and the sender
+                            // will never send it again.
+                            //
+                            // Recorded before delivering, while the frontier
+                            // still marks the bottom of the gap. It used to be
+                            // a permanent loss: when the missing id finally did
+                            // arrive -- which is exactly what the
+                            // BLOCKED-RECOVERY stall produces once it clears --
+                            // `safe_to_ack` called it already-delivered, so it
+                            // was re-ACKed and cleared and never reached the
+                            // application. Late and out of order beats gone.
+                            self.tracker.record_skipped_gap(&peer_id, &message_id);
                             log::warn!(target: "ism", "[ILM-INBOUND] Delivering msg_id={message_id} from peer {peer_id} out of order after {GAP_PATIENCE_SECS}s: the id beneath it never arrived");
                         } else {
                             log::debug!(target: "ism", "[ILM-INBOUND] Holding msg_id={message_id} from peer {peer_id}: waiting for the gap beneath it");
@@ -995,6 +1028,24 @@ where
     }
 
     // Modify process_network_messages to update the tracker
+    /// Backdate when a message was received, so `held_too_long` fires without a
+    /// test waiting out `GAP_PATIENCE_SECS`.
+    ///
+    /// Feature-gated and narrow on purpose: the alternative was making the whole
+    /// tracker public, and the gap-patience path is worth testing without a
+    /// twenty-second sleep in the suite.
+    #[cfg(feature = "testing")]
+    pub fn backdate_receipt_for_tests(
+        &self,
+        peer_id: M::PeerId,
+        message_id: M::MessageId,
+        received_at_secs: u64,
+    ) {
+        self.tracker
+            .received_messages
+            .insert((peer_id, message_id), received_at_secs);
+    }
+
     /// Returns false once the underlying transport has closed, so the caller stops
     /// rather than spinning on a receiver that is Ready(None) forever.
     async fn process_next_network_message(&self) -> bool {

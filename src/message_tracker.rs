@@ -3,6 +3,13 @@ use dashmap::{DashMap, DashSet};
 use num::One;
 use std::sync::Arc;
 
+/// How many skipped ids one gap may contribute to the late-delivery set.
+///
+/// `get_next_id` numbers densely, so a real gap is small. A large one means a
+/// defect or a hostile id, and recording it would trade a bounded loss for an
+/// unbounded set.
+const MAX_RECORDED_GAP: usize = 1024;
+
 pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     pub last_acked: DashMap<M::PeerId, M::MessageId>,
     pub last_sent: DashMap<M::PeerId, M::MessageId>,
@@ -22,6 +29,25 @@ pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     ///
     /// This is the id it is safe to acknowledge up to.
     pub last_delivered: DashMap<M::PeerId, M::MessageId>,
+    /// Ids the frontier was advanced PAST without ever delivering them.
+    ///
+    /// `held_too_long` breaks a permanent hold by delivering out of order, and
+    /// that advances the frontier over the gap beneath it. The comment at that
+    /// site calls it "a real loss", and it was: when the missing id finally
+    /// arrived, `safe_to_ack` said it was already delivered, so it was re-ACKed
+    /// and cleared and the application never saw it.
+    ///
+    /// It only has to be lost if it never comes. Recording what was skipped
+    /// turns "permanently discarded" into "delivered late, out of order", which
+    /// is the same order guarantee the gap-patience delivery already broke.
+    ///
+    /// In memory only, deliberately. The scenario this exists for is a stall
+    /// that clears within the process; across a restart the durable frontier
+    /// governs and a late arrival is discarded exactly as before -- no worse
+    /// than today, and persisting it would put unbounded per-peer state on the
+    /// durable path for a case that cannot be distinguished from a stale
+    /// duplicate.
+    pub skipped: DashSet<(M::PeerId, M::MessageId)>,
     pub backend: Arc<B>,
 }
 
@@ -37,6 +63,7 @@ where
             next_unique_id: Default::default(),
             received_messages: Default::default(),
             has_delivered: Default::default(),
+            skipped: Default::default(),
             last_received_from: Default::default(),
             last_delivered: Default::default(),
             backend,
@@ -349,6 +376,47 @@ where
             Some(frontier) => *msg_id <= *frontier,
             None => false,
         }
+    }
+
+    /// Remember every id the frontier is about to skip over.
+    ///
+    /// Call BEFORE the out-of-order delivery advances the frontier, so the
+    /// current frontier still marks the bottom of the gap.
+    ///
+    /// Bounded: a gap wider than `MAX_RECORDED_GAP` is not recorded at all. A
+    /// jump that large is a defect or a hostile id, and filling a set with it
+    /// would be exactly the unbounded-growth shape this codebase watches for --
+    /// the messages are no less lost for our having listed them.
+    pub fn record_skipped_gap(&self, peer_id: &M::PeerId, delivering: &M::MessageId) {
+        let Some(frontier) = self.last_delivered.get(peer_id).map(|f| *f) else {
+            return;
+        };
+
+        let mut id = frontier + M::MessageId::one();
+        let mut recorded: usize = 0;
+        while id < *delivering {
+            if recorded >= MAX_RECORDED_GAP {
+                log::warn!(target: "ism", "[ILM-INBOUND] Gap beneath {delivering:?} from peer {peer_id:?} is wider than {MAX_RECORDED_GAP}; not recording it");
+                return;
+            }
+            self.skipped.insert((*peer_id, id));
+            recorded += 1;
+            id = id + M::MessageId::one();
+        }
+
+        if recorded > 0 {
+            log::warn!(target: "ism", "[ILM-INBOUND] Skipped {recorded} id(s) beneath {delivering:?} from peer {peer_id:?}; they will be delivered late if they arrive");
+        }
+    }
+
+    /// Whether this id was skipped by a gap-patience delivery and never seen.
+    pub fn was_skipped(&self, peer_id: &M::PeerId, msg_id: &M::MessageId) -> bool {
+        self.skipped.contains(&(*peer_id, *msg_id))
+    }
+
+    /// Forget a skipped id, once it has arrived and been delivered late.
+    pub fn clear_skipped(&self, peer_id: &M::PeerId, msg_id: &M::MessageId) {
+        self.skipped.remove(&(*peer_id, *msg_id));
     }
 
     /// Record that everything up to and including `msg_id` has been delivered.
