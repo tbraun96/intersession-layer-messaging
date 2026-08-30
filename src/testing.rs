@@ -171,6 +171,10 @@ pub struct InMemoryNetwork<M: MessageMetadata> {
     messages: InMemoryMessageQueue<M::PeerId, M>,
     my_rx: Arc<Mutex<citadel_io::tokio::sync::mpsc::UnboundedReceiver<Payload<M>>>>,
     my_id: M::PeerId,
+    /// How many times `next_message` has resolved to None, i.e. been polled on a
+    /// closed transport. A caller that treats close as terminal reads 1; one that
+    /// spins reads whatever it managed before the test looked.
+    closed_polls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub type InMemoryMessageQueue<PeerId, M> =
@@ -182,6 +186,7 @@ impl<M: MessageMetadata> Clone for InMemoryNetwork<M> {
             messages: self.messages.clone(),
             my_rx: self.my_rx.clone(),
             my_id: self.my_id,
+            closed_polls: self.closed_polls.clone(),
         }
     }
 }
@@ -193,6 +198,7 @@ impl<M: MessageMetadata> Default for InMemoryNetwork<M> {
             messages: Arc::new(RwLock::new(Default::default())),
             my_rx: Arc::new(Mutex::new(rx)),
             my_id: M::PeerId::default(),
+            closed_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -209,7 +215,24 @@ impl<M: MessageMetadata> InMemoryNetwork<M> {
             messages: self.messages.clone(),
             my_rx: Arc::new(Mutex::new(rx)),
             my_id: id,
+            closed_polls: self.closed_polls.clone(),
         }
+    }
+
+    /// Drop a peer's sender, closing the receiver that peer is listening on.
+    ///
+    /// The transport's senders live in a shared map, so dropping a returned
+    /// `InMemoryNetwork` handle closes nothing — every clone, including the one
+    /// inside an ILM, keeps the map alive. This is the only way a test can put
+    /// the transport into the state production reaches on `close_connection()`,
+    /// where `next_message()` is `Ready(None)` on every poll.
+    pub async fn disconnect_peer(&self, id: M::PeerId) {
+        self.messages.write().await.remove(&id);
+    }
+
+    /// How many times this transport has been polled after closing.
+    pub fn closed_polls(&self) -> usize {
+        self.closed_polls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn send_to_peer(
@@ -233,7 +256,12 @@ impl<M: MessageMetadata> UnderlyingSessionTransport for InMemoryNetwork<M> {
     type Message = M;
 
     async fn next_message(&self) -> Option<Payload<Self::Message>> {
-        self.my_rx.lock().await.recv().await
+        let next = self.my_rx.lock().await.recv().await;
+        if next.is_none() {
+            self.closed_polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        next
     }
 
     async fn send_message(

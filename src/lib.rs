@@ -457,7 +457,17 @@ where
                     select! {
                         res0 = recv_fut => {
                             if res0.is_none() {
+                                // Return, exactly as the outbound loop above does. A
+                                // tokio mpsc receiver yields None only once the channel
+                                // is closed AND drained, and it never re-opens -- so
+                                // recv() is Ready(None) forever after. Logging and
+                                // falling through span the loop with nothing to await,
+                                // and on wasm (spawn_local, one thread, cooperative)
+                                // that never returns control to the JS event loop: the
+                                // tab freezes. The outbound twin got this right; this
+                                // one did not.
                                 log::warn!(target: "ism", "Poll inbound channel closed");
+                                return;
                             }
                         },
                         _ = sleep_fut => {},
@@ -474,7 +484,16 @@ where
                         break;
                     }
 
-                    this.process_next_network_message().await;
+                    // Stop when the transport is gone. `next_message()` resolves to
+                    // None only when the underlying receiver is closed and drained,
+                    // which is terminal -- so without this the loop spins on a future
+                    // that is immediately Ready, with nothing to await. On wasm that
+                    // starves the JS event loop and freezes the tab, and every
+                    // close_connection() reaches it: logout, leader demotion, teardown.
+                    if !this.process_next_network_message().await {
+                        log::warn!(target: "ism", "Network transport closed; stopping network listener");
+                        break;
+                    }
                 }
             };
 
@@ -976,8 +995,13 @@ where
     }
 
     // Modify process_network_messages to update the tracker
-    async fn process_next_network_message(&self) {
-        if let Some(message) = self.network.next_message().await {
+    /// Returns false once the underlying transport has closed, so the caller stops
+    /// rather than spinning on a receiver that is Ready(None) forever.
+    async fn process_next_network_message(&self) -> bool {
+        let Some(message) = self.network.next_message().await else {
+            return false;
+        };
+        {
             match message {
                 Payload::Poll {
                     from_id,
@@ -1040,7 +1064,8 @@ where
                     log::info!(target: "ism", "[ILM-ACK-RECV] Received ACK from_id={from_id} msg_id={message_id} to_id={to_id} local_id={}", self.network.local_id());
                     if to_id != self.network.local_id() {
                         log::warn!(target: "ism", "[ILM-ACK-RECV] ACK not for us - ignoring");
-                        return;
+                        // Ignoring one misaddressed ACK; the transport is unaffected.
+                        return true;
                     }
 
                     // Update the tracker with the new ACK
@@ -1067,7 +1092,7 @@ where
                 Payload::Message(msg) => {
                     if msg.destination_id() != self.network.local_id() {
                         log::warn!(target: "ism", "Received message for another peer");
-                        return;
+                        return true; // skipped this message; the transport is unaffected
                     }
 
                     if let Ok(msgs) = self.backend.get_pending_outbound().await {
@@ -1092,7 +1117,7 @@ where
                             } else {
                                 log::debug!(target: "ism", "Duplicate msg_id={} from {} is above the delivery frontier; not ACKing", msg.message_id(), msg.source_id());
                             }
-                            return;
+                            return true; // skipped this message; the transport is unaffected
                         }
                     }
 
@@ -1166,6 +1191,7 @@ where
                 }
             }
         }
+        true
     }
 
     /// The preferred entrypoint for sending messages. Unlike `[Self::send_raw_message]`, this
