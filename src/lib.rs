@@ -314,6 +314,25 @@ const SEND_WINDOW: usize = 8;
 /// one delivery out of order announced at `warn!`.
 const GAP_PATIENCE_SECS: u64 = 20;
 
+/// How many undelivered messages one peer may have queued before sends to it
+/// are refused.
+///
+/// Stop-and-wait never gives up: a peer that stops acknowledging keeps its head
+/// retransmitting and its queue growing for as long as the application keeps
+/// sending. Nothing capped it and nothing aged it, so the backend grew without
+/// bound — in the browser, until the tab died.
+///
+/// REFUSED, not dropped. Discarding a queued message would put a hole in the id
+/// run, and acknowledgement is cumulative: the receiver would hold everything
+/// behind the hole until gap patience fired and then skip the missing id
+/// permanently. Refusing at the door mints no id, so the run stays contiguous
+/// and the CALLER learns — which is the difference between a message that failed
+/// and a message that vanished.
+///
+/// Ten times the largest burst the suite sends (96), so this bounds a wedged
+/// link and never a working one.
+const MAX_PENDING_PER_PEER: usize = 1024;
+
 const RETRANSMIT_AFTER_BLOCKS: u32 = 5;
 
 /// Max consecutive blocks before clearing stale state for a peer.
@@ -1359,6 +1378,29 @@ where
         }
 
         if self.can_run() {
+            // Backpressure, before an id is minted. See MAX_PENDING_PER_PEER.
+            let destination = message.destination_id();
+            let queued = self
+                .backend
+                .get_pending_outbound()
+                .await
+                .map(|pending| {
+                    pending
+                        .iter()
+                        .filter(|m| m.destination_id() == destination)
+                        .count()
+                })
+                .unwrap_or(0);
+            if queued >= MAX_PENDING_PER_PEER {
+                log::warn!(target: "ism", "[ILM-OUTBOUND] Refusing send to peer {destination:?}: {queued} already queued and undelivered");
+                return Err(NetworkError::SendFailed {
+                    reason: format!(
+                        "{queued} messages are already queued and unacknowledged for this peer"
+                    ),
+                    message,
+                });
+            }
+
             self.backend
                 .store_outbound(message)
                 .await
