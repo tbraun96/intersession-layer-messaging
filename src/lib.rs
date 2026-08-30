@@ -1170,12 +1170,46 @@ where
                     }
 
                     log::trace!(target: "ism", "Received ACK from peer {from_id}, message # {message_id}");
-                    if let Err(e) = self
-                        .backend
-                        .clear_message_outbound(from_id, message_id)
-                        .await
+
+                    // Everything at or below the acked id, not just the id named.
+                    //
+                    // Acknowledgement is cumulative everywhere else in this
+                    // crate: `update_ack` keeps a high-water mark and discards
+                    // anything at or below it, the window counts in flight as
+                    // `id <= last_sent && id > last_acked`, and SEND_WINDOW is
+                    // justified on exactly that -- one surviving ACK retires the
+                    // whole window. Clearing only the named id left the rows for
+                    // ids whose own ACKs were lost sitting in the outbound store.
+                    //
+                    // Which is not merely a leak. `process_outbound` sorts
+                    // ascending and stops at the first message it cannot send,
+                    // and `can_send` is false for an id at or below
+                    // `last_acked`. The head branch that handles "cannot send"
+                    // assumes one reason for it -- sent and awaiting an ACK --
+                    // so it retransmits. The receiver dedups and re-ACKs the
+                    // same id, `update_ack` discards that as stale, and the peer
+                    // stays blocked until MAX_CONSECUTIVE_BLOCKS (fifty cycles,
+                    // ten seconds) trips BLOCKED-RECOVERY, which wipes the
+                    // peer's ack/sent state and closes the send window back to
+                    // one. Per stale row.
+                    let covered: Vec<M::MessageId> = match self.backend.get_pending_outbound().await
                     {
-                        log::error!(target: "ism", "Failed to clear ACKed message: {e:?}");
+                        Ok(pending) => pending
+                            .iter()
+                            .filter(|m| {
+                                m.destination_id() == from_id && m.message_id() <= message_id
+                            })
+                            .map(|m| m.message_id())
+                            .collect(),
+                        Err(e) => {
+                            log::error!(target: "ism", "Failed to read outbound while clearing ACKed messages: {e:?}");
+                            vec![message_id]
+                        }
+                    };
+                    for id in covered {
+                        if let Err(e) = self.backend.clear_message_outbound(from_id, id).await {
+                            log::error!(target: "ism", "Failed to clear ACKed message {id:?}: {e:?}");
+                        }
                     }
 
                     // Poll any pending outbound messages
