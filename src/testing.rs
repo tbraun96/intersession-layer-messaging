@@ -13,6 +13,13 @@ use std::sync::Arc;
 pub struct InMemoryBackend<M: MessageMetadata> {
     outbound: Mailbox<M::PeerId, M::MessageId, M>,
     inbound: Mailbox<M::PeerId, M::MessageId, M>,
+    /// How many times the pending queues have been read.
+    ///
+    /// A leaked background loop is invisible from the outside except by what it
+    /// keeps doing to shared state, and reading the pending queues every poll
+    /// cycle is what it does. Counting them lets a test tell a stopped loop
+    /// from a running one.
+    reads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(not(target_arch = "wasm32"))]
     random_dir: std::path::PathBuf,
     #[cfg(target_arch = "wasm32")]
@@ -22,6 +29,11 @@ pub struct InMemoryBackend<M: MessageMetadata> {
 type Mailbox<PeerId, MessageId, Message> = Arc<RwLock<HashMap<(PeerId, MessageId), Message>>>;
 
 impl<M: MessageMetadata> InMemoryBackend<M> {
+    /// How many times the pending queues have been read. See the field.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         let random_dir = {
@@ -35,6 +47,7 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
         Self {
             outbound: Arc::new(RwLock::new(HashMap::new())),
             inbound: Arc::new(RwLock::new(HashMap::new())),
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(not(target_arch = "wasm32"))]
             random_dir,
             #[cfg(target_arch = "wasm32")]
@@ -122,11 +135,15 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
     }
 
     async fn get_pending_outbound(&self) -> Result<Vec<M>, BackendError<M>> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let outbound = self.outbound.read().await;
         Ok(outbound.values().cloned().collect())
     }
 
     async fn get_pending_inbound(&self) -> Result<Vec<M>, BackendError<M>> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let inbound = self.inbound.read().await;
         Ok(inbound.values().cloned().collect())
     }
@@ -803,19 +820,18 @@ mod tests {
             contents: vec![2],
         };
 
-        // Send messages in parallel using separate threads
-        let send_handle1 = citadel_io::tokio::spawn({
-            let message1 = message1.clone();
-            async move { message_system1.send_raw_message(message1).await }
-        });
-
-        let send_handle2 = citadel_io::tokio::spawn({
-            let message2 = message2.clone();
-            async move { message_system2.send_raw_message(message2).await }
-        });
-
-        let res1 = send_handle1.await.unwrap();
-        let res2 = send_handle2.await.unwrap();
+        // Concurrent, but WITHOUT moving the ILMs into spawned tasks.
+        //
+        // This used to `spawn` a task per send with `async move`, which handed
+        // each ILM to the task and dropped it the moment the send returned --
+        // and then asserted on messages delivered afterwards. That only worked
+        // because Drop was a no-op and the background loops outlived their
+        // owner. Dropping an ILM now stops its loops, which is the point, so
+        // the test has to keep the handles it depends on.
+        let (res1, res2) = citadel_io::tokio::join!(
+            message_system1.send_raw_message(message1.clone()),
+            message_system2.send_raw_message(message2.clone()),
+        );
 
         assert!(res1.is_ok());
         assert!(res2.is_ok());
@@ -849,35 +865,37 @@ mod tests {
 
         const NUM_MESSAGES: u8 = 255;
 
-        // Create tasks for peer 1 sending messages
-        let send_task1 = citadel_io::tokio::spawn({
-            async move {
-                for i in 0..NUM_MESSAGES {
-                    let message = TestMessage {
-                        source_id: 1,
-                        destination_id: 2,
-                        message_id: i as _,
-                        contents: vec![i],
-                    };
-                    message_system1.send_raw_message(message).await.unwrap();
-                }
+        // Sending futures, NOT spawned tasks that take ownership.
+        //
+        // `spawn(async move { ... })` handed each ILM to its task and dropped it
+        // when the sending finished, then the receive tasks below asserted on
+        // messages delivered after that. It only passed because Drop was a
+        // no-op and the loops outlived their owner. Dropping an ILM now stops
+        // its loops, so the handles have to live as long as the test needs
+        // them.
+        let send_task1 = async {
+            for i in 0..NUM_MESSAGES {
+                let message = TestMessage {
+                    source_id: 1,
+                    destination_id: 2,
+                    message_id: i as _,
+                    contents: vec![i],
+                };
+                message_system1.send_raw_message(message).await.unwrap();
             }
-        });
+        };
 
-        // Create tasks for peer 2 sending messages
-        let send_task2 = citadel_io::tokio::spawn({
-            async move {
-                for i in 0..NUM_MESSAGES {
-                    let message = TestMessage {
-                        source_id: 2,
-                        destination_id: 1,
-                        message_id: i as _,
-                        contents: vec![i],
-                    };
-                    message_system2.send_raw_message(message).await.unwrap();
-                }
+        let send_task2 = async {
+            for i in 0..NUM_MESSAGES {
+                let message = TestMessage {
+                    source_id: 2,
+                    destination_id: 1,
+                    message_id: i as _,
+                    contents: vec![i],
+                };
+                message_system2.send_raw_message(message).await.unwrap();
             }
-        });
+        };
 
         // Create tasks for receiving messages
         let receive_task1 = citadel_io::tokio::spawn(async move {
@@ -912,15 +930,12 @@ mod tests {
             }
         });
 
-        // Wait for all tasks to complete
-        let results =
-            futures::future::join_all(vec![send_task1, send_task2, receive_task1, receive_task2])
-                .await;
-
-        // Check if any task failed
-        for result in results {
-            result.unwrap();
-        }
+        // The receives are still spawned tasks (they own only their receivers);
+        // the sends are futures driven here, so the ILMs stay owned by the test.
+        let (_, _, r1, r2) =
+            citadel_io::tokio::join!(send_task1, send_task2, receive_task1, receive_task2);
+        r1.unwrap();
+        r2.unwrap();
     }
 
     //#[citadel_io::tokio::test(flavor = "multi_thread", worker_threads = 4)]

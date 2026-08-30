@@ -343,6 +343,15 @@ where
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
     /// Tracks consecutive block counts per peer for fallback clearing
     blocked_count: Arc<DashMap<M::PeerId, u32>>,
+    /// True only for the handle `new()` returned; false for the clone the
+    /// background task owns.
+    ///
+    /// Drop used to ask `Arc::strong_count(&is_running) == 1`, which cannot be
+    /// true while there is anything to stop: the task's own clone holds a
+    /// second reference for exactly as long as the loops run. A flag says what
+    /// the count was being used to guess at, and does not change meaning if a
+    /// second internal clone is ever added.
+    owns_background_task: bool,
 }
 
 impl<M, B, L, N> Drop for ILM<M, B, L, N>
@@ -353,9 +362,24 @@ where
     N: UnderlyingSessionTransport<Message = M> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.is_running) == 1 {
-            let _ = self.poll_outbound_tx.send(());
+        if !self.owns_background_task {
+            return;
         }
+
+        // Stop, do not merely nudge. This used to send on `poll_outbound_tx`,
+        // which wakes a loop that then re-reads `is_running` -- still true --
+        // and carries on. Combined with a `strong_count == 1` guard that the
+        // task's own clone made unreachable, Drop was a complete no-op: every
+        // WASM-client restart or close left the outbound, inbound, network and
+        // peer-polling loops running for ever against an abandoned backend,
+        // polling every 200ms and syncing stale tracker state onto the same
+        // durable per-CID keys the REPLACEMENT instance for that CID uses.
+        self.toggle_off();
+
+        // Wake both pollers so they observe it now rather than after their
+        // next timeout.
+        let _ = self.poll_outbound_tx.send(());
+        let _ = self.poll_inbound_tx.send(());
     }
 }
 
@@ -376,6 +400,7 @@ where
             backend: backend.clone(),
             local_delivery: Arc::new(Mutex::new(Some(local_delivery))),
             network: Arc::new(network),
+            owns_background_task: true,
             is_running: Arc::new(AtomicBool::new(true)),
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             tracker: Arc::new(MessageTracker::new(backend).await?),
@@ -402,6 +427,7 @@ where
             poll_outbound_tx: self.poll_outbound_tx.clone(),
             known_peers: self.known_peers.clone(),
             blocked_count: self.blocked_count.clone(),
+            owns_background_task: false,
         }
     }
 
