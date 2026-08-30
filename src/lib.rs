@@ -929,6 +929,7 @@ where
                         // late -- ordering was already broken by the delivery
                         // that skipped it, and a message out of order beats a
                         // message gone.
+                        let mut delivered_late = false;
                         if self.tracker.was_skipped(&peer_id, &message_id) {
                             log::warn!(target: "ism", "[ILM-INBOUND] Late delivery of skipped msg_id={message_id} from peer {peer_id}");
                             // `delivery` is the binding from the enclosing
@@ -942,6 +943,7 @@ where
                             }
                             self.tracker.has_delivered.insert((peer_id, message_id));
                             self.tracker.clear_skipped(&peer_id, &message_id);
+                            delivered_late = true;
                         }
 
                         // Re-ACK, do NOT just drop it.
@@ -950,7 +952,11 @@ where
                         // first ACK, so it is still waiting on this exact id.
                         // Suppressing the ACK is what makes retransmission
                         // useless; re-ACKing is what makes it idempotent.
-                        log::info!(target: "ism", "[ILM-ACK] Re-ACKing already-delivered msg_id={message_id} to peer {peer_id}");
+                        if delivered_late {
+                            log::info!(target: "ism", "[ILM-ACK] ACKing late-delivered msg_id={message_id} to peer {peer_id}");
+                        } else {
+                            log::info!(target: "ism", "[ILM-ACK] Re-ACKing already-delivered msg_id={message_id} to peer {peer_id}");
+                        }
                         if let Err(e) = self
                             .send_message_internal(self.create_ack_message(&message))
                             .await
@@ -1014,6 +1020,17 @@ where
                         Ok(()) => {
                             log::info!(target: "ism", "[ILM-INBOUND] Delivered msg_id={message_id} from peer {peer_id}");
                             self.tracker.has_delivered.insert((peer_id, message_id));
+
+                            // An id leaves `skipped` the moment it is
+                            // delivered, by WHICHEVER path delivered it. The
+                            // late-delivery branch above is not the only way
+                            // out: if the out-of-order deliver fails, the
+                            // frontier stays put, and a missing id arriving
+                            // before the retry succeeds is delivered here, in
+                            // order, having already been recorded as skipped.
+                            // Left behind, that entry both leaks and re-delivers
+                            // the message if it is ever retransmitted.
+                            self.tracker.clear_skipped(&peer_id, &message_id);
 
                             // BEFORE the ACK. The ACK says "everything up to
                             // here is delivered", and the frontier is what makes

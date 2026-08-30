@@ -3,12 +3,12 @@ use dashmap::{DashMap, DashSet};
 use num::One;
 use std::sync::Arc;
 
-/// How many skipped ids one gap may contribute to the late-delivery set.
+/// How many skipped ids ONE gap may contribute to the late-delivery set.
 ///
 /// `get_next_id` numbers densely, so a real gap is small. A large one means a
-/// defect or a hostile id, and recording it would trade a bounded loss for an
-/// unbounded set.
-const MAX_RECORDED_GAP: usize = 1024;
+/// defect or a hostile id. Deliberately well below `MAX_MAP_SIZE` so that no
+/// single gap can evict most of the set it shares with every other peer.
+const MAX_RECORDED_GAP: usize = 256;
 
 pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     pub last_acked: DashMap<M::PeerId, M::MessageId>,
@@ -47,7 +47,14 @@ pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     /// than today, and persisting it would put unbounded per-peer state on the
     /// durable path for a case that cannot be distinguished from a stale
     /// duplicate.
-    pub skipped: DashSet<(M::PeerId, M::MessageId)>,
+    ///
+    /// Bounded two ways, because the entry for an id that never arrives is
+    /// otherwise never removed -- and in the usual case it never does arrive,
+    /// since the cumulative ACK for the out-of-order id already retired it at
+    /// the sender. `MAX_RECORDED_GAP` caps what one gap may add;
+    /// `drop_lru_if_full` caps the whole set at `MAX_MAP_SIZE`, evicting the
+    /// oldest, which is why the value is the receipt timestamp.
+    pub skipped: DashMap<(M::PeerId, M::MessageId), u64>,
     pub backend: Arc<B>,
 }
 
@@ -383,35 +390,39 @@ where
     /// Call BEFORE the out-of-order delivery advances the frontier, so the
     /// current frontier still marks the bottom of the gap.
     ///
-    /// Bounded: a gap wider than `MAX_RECORDED_GAP` is not recorded at all. A
-    /// jump that large is a defect or a hostile id, and filling a set with it
-    /// would be exactly the unbounded-growth shape this codebase watches for --
-    /// the messages are no less lost for our having listed them.
+    /// Bounded, and the bound TRUNCATES rather than refuses: the first
+    /// `MAX_RECORDED_GAP` ids of the gap are recorded and any beyond that are
+    /// not, so they stay permanently lost exactly as they were before this
+    /// mechanism existed. Truncating beats refusing -- recording nothing for a
+    /// wide gap would throw away the recoverable head of it too -- but the
+    /// ceiling is real and the warning below names what it costs.
     pub fn record_skipped_gap(&self, peer_id: &M::PeerId, delivering: &M::MessageId) {
         let Some(frontier) = self.last_delivered.get(peer_id).map(|f| *f) else {
             return;
         };
 
+        let now = platform_timestamp_secs();
         let mut id = frontier + M::MessageId::one();
         let mut recorded: usize = 0;
         while id < *delivering {
             if recorded >= MAX_RECORDED_GAP {
-                log::warn!(target: "ism", "[ILM-INBOUND] Gap beneath {delivering:?} from peer {peer_id:?} is wider than {MAX_RECORDED_GAP}; not recording it");
-                return;
+                log::warn!(target: "ism", "[ILM-INBOUND] Gap beneath {delivering:?} from peer {peer_id:?} is wider than {MAX_RECORDED_GAP}; recorded the first {recorded} id(s), the rest CANNOT be delivered late and are lost");
+                break;
             }
-            self.skipped.insert((*peer_id, id));
+            self.skipped.insert((*peer_id, id), now);
             recorded += 1;
             id = id + M::MessageId::one();
         }
 
         if recorded > 0 {
             log::warn!(target: "ism", "[ILM-INBOUND] Skipped {recorded} id(s) beneath {delivering:?} from peer {peer_id:?}; they will be delivered late if they arrive");
+            self.drop_lru_if_full();
         }
     }
 
     /// Whether this id was skipped by a gap-patience delivery and never seen.
     pub fn was_skipped(&self, peer_id: &M::PeerId, msg_id: &M::MessageId) -> bool {
-        self.skipped.contains(&(*peer_id, *msg_id))
+        self.skipped.contains_key(&(*peer_id, *msg_id))
     }
 
     /// Forget a skipped id, once it has arrived and been delivered late.
@@ -485,6 +496,22 @@ where
             let oldest = self.received_messages.iter().min_by_key(|v| *v.value());
             if let Some(oldest) = oldest {
                 let _ = self.received_messages.remove(oldest.key());
+            }
+        }
+        // `skipped` needs this more than `received_messages` does: an id that
+        // never arrives is never cleared by delivery, and the usual outcome of
+        // a gap-patience skip is that it never arrives.
+        while self.skipped.len() > MAX_MAP_SIZE {
+            let oldest = self
+                .skipped
+                .iter()
+                .min_by_key(|v| *v.value())
+                .map(|v| *v.key());
+            match oldest {
+                Some(key) => {
+                    let _ = self.skipped.remove(&key);
+                }
+                None => break,
             }
         }
     }
