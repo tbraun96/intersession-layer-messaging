@@ -1,5 +1,5 @@
 use crate::{platform_timestamp_secs, Backend, BackendError, MessageMetadata, MAX_MAP_SIZE};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use num::One;
 use std::sync::Arc;
 
@@ -15,7 +15,19 @@ pub struct MessageTracker<M: MessageMetadata, B: Backend<M>> {
     pub last_sent: DashMap<M::PeerId, M::MessageId>,
     pub next_unique_id: DashMap<M::PeerId, M::MessageId>,
     pub received_messages: DashMap<(M::PeerId, M::MessageId), u64>,
-    pub has_delivered: DashSet<(M::PeerId, M::MessageId)>,
+    /// Messages already handed to the application, as a fast in-memory check.
+    ///
+    /// A redundant fast path, not the authority: the durable `last_delivered`
+    /// frontier is what `safe_to_ack` consults, and the inbound path says so —
+    /// "asked of the DURABLE frontier rather than the in-memory `has_delivered`
+    /// set, because that set does not survive a restart". So evicting an entry
+    /// costs at most a fallback to the check that was always correct.
+    ///
+    /// Bounded for that reason. It was insert-only: one entry per delivered
+    /// message for the life of the process, which in a long-lived browser tab is
+    /// every message ever received. Timestamped so `drop_lru_if_full` can evict
+    /// the oldest, exactly as it does for `received_messages` and `skipped`.
+    pub has_delivered: DashMap<(M::PeerId, M::MessageId), u64>,
     /// Tracks the highest message ID received FROM each peer (for resync)
     pub last_received_from: DashMap<M::PeerId, M::MessageId>,
     /// The highest id delivered from each peer with NO GAP beneath it.
@@ -461,7 +473,7 @@ where
     /// so a failed store leaves nothing claiming the message arrived.
     pub fn has_received(&self, peer_id: M::PeerId, msg_id: M::MessageId) -> bool {
         self.received_messages.contains_key(&(peer_id, msg_id))
-            || self.has_delivered.contains(&(peer_id, msg_id))
+            || self.has_delivered.contains_key(&(peer_id, msg_id))
     }
 
     pub async fn mark_received(
@@ -473,7 +485,7 @@ where
             return Ok(false);
         }
 
-        if self.has_delivered.contains(&(peer_id, msg_id)) {
+        if self.has_delivered.contains_key(&(peer_id, msg_id)) {
             return Ok(false);
         }
 
@@ -496,6 +508,23 @@ where
             let oldest = self.received_messages.iter().min_by_key(|v| *v.value());
             if let Some(oldest) = oldest {
                 let _ = self.received_messages.remove(oldest.key());
+            }
+        }
+        // Same ceiling for the delivered set. It was insert-only, so a tab that
+        // stayed open accumulated one entry per message ever received; the
+        // durable frontier is the authority, so an eviction costs a fallback to
+        // the check that was always correct.
+        while self.has_delivered.len() > MAX_MAP_SIZE {
+            let oldest = self
+                .has_delivered
+                .iter()
+                .min_by_key(|v| *v.value())
+                .map(|v| *v.key());
+            match oldest {
+                Some(key) => {
+                    let _ = self.has_delivered.remove(&key);
+                }
+                None => break,
             }
         }
         // `skipped` needs this more than `received_messages` does: an id that
@@ -641,5 +670,73 @@ mod tests {
 
         assert!(!tracker.can_send(&ALICE, &5), "5 is acknowledged");
         assert!(tracker.can_send(&ALICE, &6), "6 is past the mark");
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod bounded_maps_tests {
+    use super::*;
+    use crate::testing::{InMemoryBackend, TestMessage};
+
+    const PEER: usize = 1;
+
+    async fn tracker() -> MessageTracker<TestMessage, InMemoryBackend<TestMessage>> {
+        MessageTracker::new(Arc::new(InMemoryBackend::<TestMessage>::new()))
+            .await
+            .expect("tracker")
+    }
+
+    /// `has_delivered` was insert-only: one entry per message, for the life of
+    /// the process. In a browser tab that stays open for a working day that is
+    /// every message ever received, in a set nothing removed from — while its
+    /// two siblings in this struct, `received_messages` and `skipped`, are both
+    /// capped by `drop_lru_if_full`.
+    ///
+    /// Evicting is safe because the set is a fast path, not the authority: the
+    /// durable `last_delivered` frontier is what `safe_to_ack` consults, and the
+    /// inbound path says so — "asked of the DURABLE frontier rather than the
+    /// in-memory `has_delivered` set, because that set does not survive a
+    /// restart". An eviction costs a fallback to the check that was always
+    /// correct.
+    #[citadel_io::tokio::test]
+    async fn the_delivered_set_is_capped() {
+        let tracker = tracker().await;
+
+        for id in 0..(MAX_MAP_SIZE * 3) {
+            tracker.has_delivered.insert((PEER, id), id as u64);
+            tracker.drop_lru_if_full();
+        }
+
+        assert!(
+            tracker.has_delivered.len() <= MAX_MAP_SIZE + 1,
+            "the delivered set holds {} entries after {} messages; nothing bounds \
+             it and a long-lived tab accumulates one per message ever received",
+            tracker.has_delivered.len(),
+            MAX_MAP_SIZE * 3
+        );
+    }
+
+    /// The opposite failure: evicting the NEWEST would make the fast path
+    /// useless exactly when it matters — a duplicate arriving close behind its
+    /// original — and the cap assertion above cannot tell the two apart.
+    #[citadel_io::tokio::test]
+    async fn it_evicts_by_age_and_keeps_the_recent() {
+        let tracker = tracker().await;
+
+        for id in 0..(MAX_MAP_SIZE * 2) {
+            tracker.has_delivered.insert((PEER, id), id as u64);
+            tracker.drop_lru_if_full();
+        }
+
+        let newest = MAX_MAP_SIZE * 2 - 1;
+        assert!(
+            tracker.has_delivered.contains_key(&(PEER, newest)),
+            "the most recently delivered id was evicted, so a duplicate arriving \
+             straight after its original misses the fast path"
+        );
+        assert!(
+            !tracker.has_delivered.contains_key(&(PEER, 0)),
+            "the oldest id survived, so eviction is not by age"
+        );
     }
 }

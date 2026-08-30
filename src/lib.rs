@@ -960,7 +960,9 @@ where
                                 log::error!(target: "ism", "[ILM-INBOUND] Failed to deliver late msg_id={message_id}: {e:?}");
                                 continue;
                             }
-                            self.tracker.has_delivered.insert((peer_id, message_id));
+                            self.tracker
+                                .has_delivered
+                                .insert((peer_id, message_id), platform_timestamp_secs());
                             self.tracker.clear_skipped(&peer_id, &message_id);
                             delivered_late = true;
                         }
@@ -1038,7 +1040,9 @@ where
                     match delivery.deliver(message.clone()).await {
                         Ok(()) => {
                             log::info!(target: "ism", "[ILM-INBOUND] Delivered msg_id={message_id} from peer {peer_id}");
-                            self.tracker.has_delivered.insert((peer_id, message_id));
+                            self.tracker
+                                .has_delivered
+                                .insert((peer_id, message_id), platform_timestamp_secs());
 
                             // An id leaves `skipped` the moment it is
                             // delivered, by WHICHEVER path delivered it. The
