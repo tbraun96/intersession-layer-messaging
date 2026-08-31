@@ -1814,6 +1814,85 @@ mod tests {
     /// - Alice's last_acked should be updated from Poll
     ///
     /// This test directly verifies the tracker behavior when processing a Poll.
+    /// A send made after an idle period must not wait out the outbound poll.
+    ///
+    /// `send_raw_message` stores the message and nudges the outbound loop. With
+    /// no nudge it sits until the next 200ms `OUTBOUND_POLL` tick.
+    ///
+    /// The measurement has to isolate an IDLE loop, which took two tries to get
+    /// right. A back-to-back chain of sends does not show the defect: the
+    /// inbound Ack and Poll handlers also nudge the outbound loop, so once
+    /// traffic is flowing every send is rescued by the previous message's ack.
+    /// Measured, a 30-round chain cost the same ~115ms as a 10-round one -- a
+    /// fixed startup cost, not a per-message one -- so the first version of this
+    /// test scaled the round count and learned nothing.
+    ///
+    /// What actually costs the user is the FIRST message after a quiet period:
+    /// opening a conversation and typing. Each round below waits past one full
+    /// poll interval so the loop is genuinely idle, then times one send in
+    /// isolation. Only the send legs are accumulated; the idle sleeps are not.
+    ///
+    /// Measured over 8 rounds: ~13ms total with the nudge, ~1130ms without
+    /// (uniform 0..200ms each, mean ~140 here). The 200ms bound sits 15x above
+    /// the former and 5x below the latter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_send_after_idle_does_not_wait_for_the_outbound_poll_timer() {
+        setup_log();
+
+        let network1 = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+        let network2 = network1.add_peer(2).await;
+
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+
+        let (tx1, mut _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+
+        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone())
+            .await
+            .unwrap();
+        let _ilm2 = ILM::new(backend2.clone(), tx2, network2.clone())
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(300)).await;
+
+        const ROUNDS: usize = 8;
+        let mut sending = Duration::ZERO;
+
+        for id in 0..ROUNDS {
+            // Go quiet: longer than one poll interval, so any nudge left over
+            // from the previous round's ack has been consumed and the loop is
+            // parked on its timer.
+            sleep(Duration::from_millis(250)).await;
+
+            let started = std::time::Instant::now();
+            ilm1.send_raw_message(TestMessage {
+                source_id: 1,
+                destination_id: 2,
+                message_id: id,
+                contents: vec![id as u8],
+            })
+            .await
+            .unwrap();
+
+            let received = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+                .await
+                .expect("peer 2 should receive within 5s")
+                .expect("channel open");
+            sending += started.elapsed();
+
+            assert_eq!(received.message_id(), id);
+        }
+
+        println!("MEASURED send legs total={sending:?} over {ROUNDS} idle rounds");
+        assert!(
+            sending < Duration::from_millis(200),
+            "{ROUNDS} sends from an idle loop took {sending:?} in total; each one \
+             waited out the 200ms outbound poll instead of being sent on the nudge"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_poll_updates_last_acked_implicit_ack() {
         setup_log();

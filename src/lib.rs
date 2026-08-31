@@ -467,20 +467,28 @@ where
                         break;
                     }
 
-                    // Use futures::select! for WASM compatibility instead of tokio::select!
-                    let recv_fut = poll_outbound_rx.recv().fuse();
-                    let sleep_fut = platform_sleep(OUTBOUND_POLL).fuse();
-                    pin_mut!(recv_fut, sleep_fut);
+                    // Scoped so the pinned futures release their borrow of
+                    // `poll_outbound_rx` before the drain below.
+                    let channel_open = {
+                        // Use futures::select! for WASM compatibility instead of tokio::select!
+                        let recv_fut = poll_outbound_rx.recv().fuse();
+                        let sleep_fut = platform_sleep(OUTBOUND_POLL).fuse();
+                        pin_mut!(recv_fut, sleep_fut);
 
-                    select! {
-                        res0 = recv_fut => {
-                            if res0.is_none() {
-                                log::warn!(target: "ism", "Poll outbound channel closed");
-                                return;
-                            }
-                        },
-                        _ = sleep_fut => {},
+                        select! {
+                            res0 = recv_fut => res0.is_some(),
+                            _ = sleep_fut => true,
+                        }
+                    };
+                    if !channel_open {
+                        log::warn!(target: "ism", "Poll outbound channel closed");
+                        return;
                     }
+
+                    // Coalesce a burst: every queued nudge asks for the same
+                    // drain, and process_outbound below sends everything
+                    // pending regardless of how many asked.
+                    while poll_outbound_rx.try_recv().is_ok() {}
 
                     this.process_outbound().await;
                 }
@@ -1415,11 +1423,22 @@ where
                     err => NetworkError::BackendError(err),
                 })?;
 
-            // NOTE: Removed poll_outbound_tx.send(()) here to prevent tight feedback loop.
-            // The periodic 200ms OUTBOUND_POLL is sufficient for processing pending messages.
-            // Triggering immediate poll after every send created: process_outbound →
-            // send_message_internal → poll_outbound_tx → process_outbound → infinite loop
-            // that flooded LocalDB requests and blocked the WASM event loop.
+            // Wake the outbound loop now rather than letting the message wait
+            // out the 200ms OUTBOUND_POLL timer (mean ~100ms per message, paid
+            // on every send).
+            //
+            // This nudge was previously removed to break a "process_outbound →
+            // send_message_internal → poll_outbound_tx → process_outbound"
+            // feedback loop. That loop cannot run through here: `store_outbound`
+            // above is called from exactly one place -- this function -- and the
+            // only callers of `send_raw_message` are the public `send_to` and
+            // the tests. `send_message_internal`, which is what process_outbound
+            // actually calls, never reaches either. So the nudge fires once per
+            // USER send, and the loop it wakes does not send on this channel.
+            //
+            // The loop also drains queued nudges before draining the backend, so
+            // a burst of sends costs one pass, not one pass per message.
+            let _ = self.poll_outbound_tx.send(());
             Ok(())
         } else {
             Err(NetworkError::SystemShutdown)
