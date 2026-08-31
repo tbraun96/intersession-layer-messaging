@@ -409,6 +409,13 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
     /// `store_values_batched` can reuse it without counting a second
     /// operation -- the counter measures ROUND TRIPS, not keys.
     async fn store_value_inner(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>> {
+        // The cfg pair is load-bearing: without it BOTH blocks compile on wasm,
+        // where `std::fs` does not exist and the first block is no longer the
+        // tail expression. Native builds hid that, because the wasm block is
+        // excluded there and the unguarded one still lands last -- so the whole
+        // crate and its 269 tests passed while the wasm target could not build
+        // at all. It was lost moving these bodies out of the trait impl.
+        #[cfg(not(target_arch = "wasm32"))]
         {
             // Store the bytes to the temp directory + key.bin
             let path = self.random_dir.join(format!("{key}.bin"));
