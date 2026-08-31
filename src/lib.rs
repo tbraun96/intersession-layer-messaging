@@ -240,6 +240,20 @@ pub trait Backend<M: MessageMetadata>: Send + Sync {
         peer_id: M::PeerId,
         message_id: M::MessageId,
     ) -> Result<(), BackendError<M>>;
+    /// Clear several outbound messages for one peer in ONE operation.
+    ///
+    /// Deliberately has no default implementation. A default that looped over
+    /// `clear_message_outbound` would compile everywhere and leave every
+    /// backend on the slow path -- which is the bug this exists to remove, and
+    /// nothing would have said so. Acknowledgement here is cumulative, so a
+    /// single ACK routinely covers a whole send window; a backend that stores
+    /// its queue as one blob then paid a full read+write per covered id, i.e.
+    /// O(window) round trips and O(window^2) bytes for one ACK.
+    async fn clear_messages_outbound(
+        &self,
+        peer_id: M::PeerId,
+        message_ids: &[M::MessageId],
+    ) -> Result<(), BackendError<M>>;
     async fn get_pending_outbound(&self) -> Result<Vec<M>, BackendError<M>>;
     async fn get_pending_inbound(&self) -> Result<Vec<M>, BackendError<M>>;
     // Simple K/V interface for tracker state
@@ -1237,10 +1251,16 @@ where
                             vec![message_id]
                         }
                     };
-                    for id in covered {
-                        if let Err(e) = self.backend.clear_message_outbound(from_id, id).await {
-                            log::error!(target: "ism", "Failed to clear ACKed message {id:?}: {e:?}");
-                        }
+                    // One operation, not one per id. A cumulative ACK covers
+                    // the whole window it retires, and clearing them
+                    // individually cost a full queue read+write EACH on a
+                    // blob-backed store.
+                    if let Err(e) = self
+                        .backend
+                        .clear_messages_outbound(from_id, &covered)
+                        .await
+                    {
+                        log::error!(target: "ism", "Failed to clear ACKed messages {covered:?}: {e:?}");
                     }
 
                     // Poll any pending outbound messages
@@ -1254,31 +1274,23 @@ where
                         return true; // skipped this message; the transport is unaffected
                     }
 
-                    if let Ok(msgs) = self.backend.get_pending_outbound().await {
-                        if msgs.iter().any(|m| {
-                            m.message_id() == msg.message_id() && m.source_id() == msg.source_id()
-                        }) {
-                            // Only up to the delivery frontier. Acknowledgement
-                            // is cumulative, so an ACK for an id above it would
-                            // retire the gap beneath it at the sender and lose
-                            // whatever is still missing.
-                            if self
-                                .tracker
-                                .safe_to_ack(&msg.source_id(), &msg.message_id())
-                            {
-                                log::warn!(target: "ism", "Received duplicate message, sending ACK");
-                                if let Err(e) = self
-                                    .send_message_internal(self.create_ack_message(&msg))
-                                    .await
-                                {
-                                    log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
-                                }
-                            } else {
-                                log::debug!(target: "ism", "Duplicate msg_id={} from {} is above the delivery frontier; not ACKing", msg.message_id(), msg.source_id());
-                            }
-                            return true; // skipped this message; the transport is unaffected
-                        }
-                    }
+                    // The duplicate check is `tracker.has_received` below, and
+                    // only that.
+                    //
+                    // There used to be another one here that fetched the ENTIRE
+                    // OUTBOUND queue -- a full store round trip per inbound
+                    // message -- and asked whether any message WE had sent
+                    // shared an id and a source with this one. It could not
+                    // match. `send_raw_message` requires `source_id ==
+                    // local_id` for everything we send and refuses
+                    // `destination_id == local_id`, so every outbound message
+                    // has our id as its source; an inbound message that reached
+                    // this point has our id as its DESTINATION, and its source
+                    // is therefore some peer. The two sources can never be
+                    // equal for conforming traffic.
+                    //
+                    // Worse than dead: had it ever matched, it returned early
+                    // and the message was never stored.
 
                     // Store BEFORE marking received.
                     //

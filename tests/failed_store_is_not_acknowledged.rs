@@ -70,6 +70,15 @@ impl Backend<TestMessage> for FlakyStore {
     ) -> Result<(), BackendError<TestMessage>> {
         self.inner.clear_message_outbound(peer_id, message_id).await
     }
+    async fn clear_messages_outbound(
+        &self,
+        peer_id: usize,
+        message_ids: &[usize],
+    ) -> Result<(), BackendError<TestMessage>> {
+        self.inner
+            .clear_messages_outbound(peer_id, message_ids)
+            .await
+    }
     async fn get_pending_outbound(&self) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
         self.inner.get_pending_outbound().await
     }

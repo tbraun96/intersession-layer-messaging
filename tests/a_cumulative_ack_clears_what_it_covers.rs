@@ -164,3 +164,75 @@ async fn an_ack_leaves_higher_ids_alone() {
 
     drop(ilm);
 }
+
+/// …and it must cost ONE store operation, not one per id.
+///
+/// Clearing the covered ids individually was correct and slow: on the
+/// blob-backed production store every `clear_message_outbound` is a full queue
+/// read plus a full queue write, so a cumulative ACK retiring a window of `k`
+/// cost `2k` round trips to the agent and O(k²) bytes serialised — for a single
+/// ACK. The two assertions above cannot see that; they only look at the
+/// resulting contents.
+#[citadel_io::tokio::test]
+async fn a_cumulative_ack_costs_one_store_operation() {
+    let backend = InMemoryBackend::<TestMessage>::new();
+
+    const WINDOW: usize = 8;
+    for id in 1..=WINDOW {
+        backend
+            .store_outbound(TestMessage::construct_from_parts(
+                LOCAL,
+                PEER,
+                id,
+                format!("m{id}").into_bytes(),
+            ))
+            .await
+            .expect("store outbound");
+    }
+    assert_eq!(
+        outbound_ids(&backend).await.len(),
+        WINDOW,
+        "the window must actually be queued, or there is nothing to batch"
+    );
+
+    let clears_before = backend.clear_ops();
+
+    let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
+    let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
+    let inbox = network.clone();
+    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+
+    inbox
+        .send_to_peer(
+            LOCAL,
+            intersession_layer_messaging::Payload::Ack {
+                from_id: PEER,
+                to_id: LOCAL,
+                message_id: WINDOW,
+            },
+        )
+        .await
+        .expect("deliver ack");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if outbound_ids(&backend).await.is_empty() {
+            break;
+        }
+        citadel_io::tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        outbound_ids(&backend).await.is_empty(),
+        "the ACK did not clear the window, so the cost assertion below would be \
+         measuring a clear that never happened"
+    );
+
+    let clears = backend.clear_ops() - clears_before;
+    assert_eq!(
+        clears, 1,
+        "clearing a window of {WINDOW} took {clears} store operations; a \
+         cumulative ACK must retire the ids it covers in one"
+    );
+
+    drop(ilm);
+}

@@ -20,6 +20,13 @@ pub struct InMemoryBackend<M: MessageMetadata> {
     /// cycle is what it does. Counting them lets a test tell a stopped loop
     /// from a running one.
     reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many separate outbound-clear OPERATIONS have been issued.
+    ///
+    /// One per call, whether that call clears one id or a hundred. On a
+    /// blob-backed store each operation is a full queue read plus a full queue
+    /// write, so this counts round trips, not messages -- which is the thing a
+    /// cumulative ACK used to multiply.
+    clear_ops: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(not(target_arch = "wasm32"))]
     random_dir: std::path::PathBuf,
     #[cfg(target_arch = "wasm32")]
@@ -30,6 +37,11 @@ type Mailbox<PeerId, MessageId, Message> = Arc<RwLock<HashMap<(PeerId, MessageId
 
 impl<M: MessageMetadata> InMemoryBackend<M> {
     /// How many times the pending queues have been read. See the field.
+    /// How many outbound-clear operations have been issued. See the field.
+    pub fn clear_ops(&self) -> usize {
+        self.clear_ops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -48,6 +60,7 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
             outbound: Arc::new(RwLock::new(HashMap::new())),
             inbound: Arc::new(RwLock::new(HashMap::new())),
             reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            clear_ops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(not(target_arch = "wasm32"))]
             random_dir,
             #[cfg(target_arch = "wasm32")]
@@ -122,6 +135,8 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
         peer_id: M::PeerId,
         message_id: M::MessageId,
     ) -> Result<(), BackendError<M>> {
+        self.clear_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut outbound = self.outbound.write().await;
         if outbound.remove(&(peer_id, message_id)).is_none() {
             log::warn!(target: "ism",
@@ -131,6 +146,30 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
             );
         }
 
+        Ok(())
+    }
+
+    async fn clear_messages_outbound(
+        &self,
+        peer_id: M::PeerId,
+        message_ids: &[M::MessageId],
+    ) -> Result<(), BackendError<M>> {
+        // One lock acquisition for the whole set. The in-memory map is not the
+        // backend the batching exists for, but taking the lock once still makes
+        // the removal atomic with respect to a concurrent reader -- which is
+        // what the blob-backed backend gets from doing this in one write.
+        self.clear_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut outbound = self.outbound.write().await;
+        for message_id in message_ids {
+            if outbound.remove(&(peer_id, *message_id)).is_none() {
+                log::warn!(target: "ism",
+                    "Failed to clear message from outbound storage dest={}/id={}",
+                    peer_id,
+                    message_id
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1088,6 +1127,13 @@ mod tests {
                 &self,
                 _: usize,
                 _: usize,
+            ) -> Result<(), BackendError<TestMessage>> {
+                Err(BackendError::StorageError("Simulated failure".into()))
+            }
+            async fn clear_messages_outbound(
+                &self,
+                _: usize,
+                _: &[usize],
             ) -> Result<(), BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
