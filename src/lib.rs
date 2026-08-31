@@ -376,6 +376,21 @@ where
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
     /// Tracks consecutive block counts per peer for fallback clearing
     blocked_count: Arc<DashMap<M::PeerId, u32>>,
+    /// Whether each queue might hold something, so an idle session stops
+    /// paying for the poll that proves it does not.
+    ///
+    /// Both loops woke every 200ms and fetched the WHOLE queue -- on the
+    /// production backend that is a round trip to the agent plus a full blob
+    /// deserialize, ten times a second per session, forever, to discover
+    /// nothing. These start `true` (a reconnect may load a persisted queue),
+    /// are re-derived by `process_outbound`/`process_inbound` from what they
+    /// actually saw, and are consulted ONLY on a timer wake: a nudge always
+    /// processes, because a nudge means something changed.
+    ///
+    /// Setting them cannot be forgotten by a future caller, because the only
+    /// place that sets them is the same place that reads the queue.
+    outbound_may_have_work: Arc<AtomicBool>,
+    inbound_may_have_work: Arc<AtomicBool>,
     /// True only for the handle `new()` returned; false for the clone the
     /// background task owns.
     ///
@@ -441,6 +456,8 @@ where
             poll_outbound_tx,
             known_peers: Arc::new(Mutex::new(Vec::new())),
             blocked_count: Arc::new(DashMap::new()),
+            outbound_may_have_work: Arc::new(AtomicBool::new(true)),
+            inbound_may_have_work: Arc::new(AtomicBool::new(true)),
         };
 
         this.spawn_background_tasks(poll_inbound_rx, poll_outbound_rx);
@@ -460,6 +477,8 @@ where
             poll_outbound_tx: self.poll_outbound_tx.clone(),
             known_peers: self.known_peers.clone(),
             blocked_count: self.blocked_count.clone(),
+            outbound_may_have_work: self.outbound_may_have_work.clone(),
+            inbound_may_have_work: self.inbound_may_have_work.clone(),
             owns_background_task: false,
         }
     }
@@ -483,18 +502,26 @@ where
 
                     // Scoped so the pinned futures release their borrow of
                     // `poll_outbound_rx` before the drain below.
-                    let channel_open = {
+                    // Which branch woke us matters: a nudge means something
+                    // changed and must always be processed, a timer tick need
+                    // not be if the queue was empty last time we looked.
+                    enum Wake {
+                        Nudged,
+                        Timer,
+                        Closed,
+                    }
+                    let wake = {
                         // Use futures::select! for WASM compatibility instead of tokio::select!
                         let recv_fut = poll_outbound_rx.recv().fuse();
                         let sleep_fut = platform_sleep(OUTBOUND_POLL).fuse();
                         pin_mut!(recv_fut, sleep_fut);
 
                         select! {
-                            res0 = recv_fut => res0.is_some(),
-                            _ = sleep_fut => true,
+                            res0 = recv_fut => if res0.is_some() { Wake::Nudged } else { Wake::Closed },
+                            _ = sleep_fut => Wake::Timer,
                         }
                     };
-                    if !channel_open {
+                    if matches!(wake, Wake::Closed) {
                         log::warn!(target: "ism", "Poll outbound channel closed");
                         return;
                     }
@@ -503,6 +530,16 @@ where
                     // drain, and process_outbound below sends everything
                     // pending regardless of how many asked.
                     while poll_outbound_rx.try_recv().is_ok() {}
+
+                    // An idle session used to pay a full queue read ten times a
+                    // second to be told there was nothing to send. Retransmission
+                    // still needs the tick -- but only while something is queued,
+                    // and that is exactly what the hint records.
+                    if matches!(wake, Wake::Timer)
+                        && !this.outbound_may_have_work.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
 
                     this.process_outbound().await;
                 }
@@ -521,8 +558,10 @@ where
                     pin_mut!(recv_fut, sleep_fut);
 
                     // futures::select_biased! equivalent: list priority branches first
+                    let mut nudged = false;
                     select! {
                         res0 = recv_fut => {
+                            nudged = true;
                             if res0.is_none() {
                                 // Return, exactly as the outbound loop above does. A
                                 // tokio mpsc receiver yields None only once the channel
@@ -538,6 +577,15 @@ where
                             }
                         },
                         _ = sleep_fut => {},
+                    }
+
+                    // See the outbound twin. The inbound queue must keep being
+                    // examined while it holds anything -- a message parked
+                    // behind a gap is released by the GAP_PATIENCE timer, not by
+                    // an event -- so the hint stays true for as long as the
+                    // queue is non-empty, and only an empty one stops the polls.
+                    if !nudged && !this.inbound_may_have_work.load(Ordering::Relaxed) {
+                        continue;
                     }
 
                     this.process_inbound().await;
@@ -660,9 +708,17 @@ where
             Ok(messages) => messages,
             Err(e) => {
                 log::error!(target: "ism", "Failed to get pending outbound messages: {e:?}");
+                // Deliberately does NOT clear the hint: a failed read is not
+                // evidence of an empty queue, and treating it as one would stop
+                // the poller on exactly the transport that just failed.
                 return;
             }
         };
+
+        // Recorded from what was actually read, right here, so the hint and the
+        // queue cannot drift apart.
+        self.outbound_may_have_work
+            .store(!pending_messages.is_empty(), Ordering::Relaxed);
 
         // Group messages by PeerId
         let mut grouped_messages: HashMap<M::PeerId, Vec<M>> = HashMap::new();
@@ -900,9 +956,13 @@ where
             Ok(messages) => messages,
             Err(e) => {
                 log::error!(target: "ism", "Failed to get pending inbound messages: {e:?}");
+                // See the outbound twin: a failed read is not an empty queue.
                 return;
             }
         };
+
+        self.inbound_may_have_work
+            .store(!pending_messages.is_empty(), Ordering::Relaxed);
 
         // De-duplicate by (source, id) — NOT by id alone.
         //
