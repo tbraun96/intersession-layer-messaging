@@ -549,12 +549,56 @@ where
     }
 
     pub fn drop_lru_if_full(&self) {
-        if self.received_messages.len() > MAX_MAP_SIZE {
-            // Remove the oldest message. The value is the time since the unix epoch
-            let oldest = self.received_messages.iter().min_by_key(|v| *v.value());
-            if let Some(oldest) = oldest {
-                let _ = self.received_messages.remove(oldest.key());
-            }
+        fn safe_to_ack_key<M: MessageMetadata, B: Backend<M>>(
+            tracker: &MessageTracker<M, B>,
+            key: &(M::PeerId, M::MessageId),
+        ) -> bool {
+            tracker.safe_to_ack(&key.0, &key.1)
+        }
+
+        while self.received_messages.len() > MAX_MAP_SIZE {
+            // NOT simply the oldest.
+            //
+            // The value is the receipt time, and `held_too_long` reads it as
+            // the gap-patience clock. The oldest entry is therefore the message
+            // that has been waiting longest behind a gap -- the very one whose
+            // clock is about to fire. Evicting it made `held_too_long` answer
+            // false (absent -> false), the sender's retransmission re-inserted
+            // it with a FRESH timestamp, and the clock started over. With the
+            // map at its ceiling, which is what sustained load means, the gap
+            // never broke at all.
+            //
+            // So prefer an entry whose message has already been delivered: its
+            // timestamp is dead weight. `safe_to_ack` is the durable frontier
+            // check -- at or below it means delivered -- and it reads a
+            // different map, so iterating this one stays safe.
+            let delivered_victim = self
+                .received_messages
+                .iter()
+                .filter(|entry| safe_to_ack_key(self, entry.key()))
+                .min_by_key(|entry| *entry.value())
+                .map(|entry| *entry.key());
+
+            let victim = match delivered_victim {
+                Some(key) => key,
+                None => {
+                    // Every entry is still holding a clock. Memory must stay
+                    // bounded, so the oldest goes -- but this is the one case
+                    // where an eviction can extend a gap, and it should not
+                    // pass in silence.
+                    log::warn!(target: "ism", "received_messages is at its ceiling and NOTHING in it has been delivered; evicting a held message, whose gap-patience clock will restart if it is retransmitted");
+                    match self
+                        .received_messages
+                        .iter()
+                        .min_by_key(|v| *v.value())
+                        .map(|v| *v.key())
+                    {
+                        Some(key) => key,
+                        None => break,
+                    }
+                }
+            };
+            let _ = self.received_messages.remove(&victim);
         }
         // Same ceiling for the delivered set. It was insert-only, so a tab that
         // stayed open accumulated one entry per message ever received; the

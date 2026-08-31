@@ -19,6 +19,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 pub mod local_delivery;
+#[cfg(feature = "testing")]
+pub mod message_tracker;
+#[cfg(not(feature = "testing"))]
 pub(crate) mod message_tracker;
 
 #[cfg(feature = "testing")]
@@ -1192,6 +1195,15 @@ where
         self.tracker
             .received_messages
             .insert((peer_id, message_id), received_at_secs);
+    }
+
+    /// Direct access to the tracker, for tests that need to drive its
+    /// bookkeeping (eviction, frontiers) without staging the network traffic
+    /// that would produce it. Feature-gated for the same reason as
+    /// `backdate_receipt_for_tests`.
+    #[cfg(feature = "testing")]
+    pub fn tracker_for_tests(&self) -> &crate::message_tracker::MessageTracker<M, B> {
+        &self.tracker
     }
 
     /// The next id this peer would be given, without consuming it.
