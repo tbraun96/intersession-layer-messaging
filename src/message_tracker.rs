@@ -309,6 +309,52 @@ where
         Ok(current)
     }
 
+    /// Give back an id that was minted but never entered the outbound queue.
+    ///
+    /// `get_next_id` advances the counter and persists it BEFORE the caller
+    /// knows whether the message will actually be stored. Every failure after
+    /// that point -- backpressure refusal, a failed `store_outbound`, a
+    /// rejected source/destination -- left a number that the receiver would
+    /// wait for and never see. Ids are consumed in order, so the next real
+    /// message arrives as `n+1` with `n` missing: the receiver holds it behind
+    /// a gap for GAP_PATIENCE_SECS before giving up and delivering out of
+    /// order. One refused send therefore costs twenty seconds of stalled
+    /// delivery for that peer.
+    ///
+    /// Only the id at the head of the counter can be returned. If something
+    /// else minted in between, `next_unique_id` has already moved past it and
+    /// rewinding would hand the same number out twice -- a far worse failure
+    /// than the gap. In that case this is a no-op and the gap stands.
+    pub async fn release_unused_id(
+        &self,
+        peer_id: M::PeerId,
+        message_id: M::MessageId,
+    ) -> Result<(), BackendError<M>> {
+        let released = {
+            let mut entry = self.next_unique_id.entry(peer_id).or_default();
+            // The compare and the set happen under the same entry guard, so a
+            // concurrent `get_next_id` cannot slip between them.
+            if *entry == message_id + M::MessageId::one() {
+                *entry = message_id;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !released {
+            log::debug!(target: "ism", "Not reclaiming id {message_id} for peer {peer_id}: another send has already minted past it");
+            return Ok(());
+        }
+
+        self.backend
+            .store_value(
+                "next_unique_id",
+                &bincode2::serialize(&self.next_unique_id).unwrap(),
+            )
+            .await
+    }
+
     pub fn can_send(&self, peer_id: &M::PeerId, msg_id: &M::MessageId) -> bool {
         let last_acked = self.last_acked.get(peer_id);
         let last_sent = self.last_sent.get(peer_id);

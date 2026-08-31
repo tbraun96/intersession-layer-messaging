@@ -1134,6 +1134,22 @@ where
             .insert((peer_id, message_id), received_at_secs);
     }
 
+    /// The next id this peer would be given, without consuming it.
+    ///
+    /// Feature-gated and read-only, for the same reason as
+    /// `backdate_receipt_for_tests`: the alternative is exposing the whole
+    /// tracker. A test that asserts a refused send did not burn an id needs to
+    /// see the counter, and minting one to look at it would be the very thing
+    /// under test.
+    #[cfg(feature = "testing")]
+    pub fn peek_next_id_for_tests(&self, peer_id: M::PeerId) -> M::MessageId {
+        self.tracker
+            .next_unique_id
+            .get(&peer_id)
+            .map(|entry| *entry)
+            .unwrap_or_default()
+    }
+
     /// Returns false once the underlying transport has closed, so the caller stops
     /// rather than spinning on a receiver that is Ready(None) forever.
     async fn process_next_network_message(&self) -> bool {
@@ -1379,7 +1395,28 @@ where
             .await
             .map_err(|err| NetworkError::BackendError(err))?;
         let message = M::construct_from_parts(my_id, to, next_id_for_this_peer_conn, contents);
-        self.send_raw_message(message).await
+        match self.send_raw_message(message).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // The id was minted above but the message never entered the
+                // queue, so nothing will ever carry it. The receiver consumes
+                // ids in order: it would hold the NEXT message behind the
+                // missing one for GAP_PATIENCE_SECS before giving up. Handing
+                // the number back costs nothing and removes the stall.
+                //
+                // Reclaiming is best-effort by design -- see
+                // `release_unused_id`, which refuses to rewind past a
+                // concurrent mint rather than risk issuing a duplicate id.
+                if let Err(reclaim_err) = self
+                    .tracker
+                    .release_unused_id(to, next_id_for_this_peer_conn)
+                    .await
+                {
+                    log::warn!(target: "ism", "Failed to reclaim unused message id {next_id_for_this_peer_conn}: {reclaim_err:?}");
+                }
+                Err(err)
+            }
+        }
     }
 
     /// This message should only be used internally or if the developer needs to manually
