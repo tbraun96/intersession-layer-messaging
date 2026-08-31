@@ -394,6 +394,14 @@ impl MessageMetadata for TestMessage {
             contents: contents.into(),
         }
     }
+
+    /// Zero, deliberately. Both ends of a test live in one process and lose
+    /// their stores together, so there is no incarnation skew to defend
+    /// against -- and deterministic ids keep the assertions readable. This is
+    /// the one place the constant is the right answer.
+    fn initial_message_id() -> Self::MessageId {
+        0
+    }
 }
 
 impl<M: MessageMetadata> InMemoryBackend<M> {

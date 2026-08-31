@@ -101,6 +101,31 @@ pub(crate) fn platform_timestamp_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+/// Microseconds since the unix epoch, for seeding a fresh id space.
+///
+/// Microseconds rather than seconds because the seed must land above the
+/// HIGHEST id the previous incarnation ever used, not merely above where it
+/// started. A session that sends N messages ends at `seed + N`, so the next
+/// incarnation's seed has to clear that -- and with seconds, a thousand
+/// messages in ten seconds would collide. Microseconds give the elapsed time a
+/// million ticks per second to outrun the message count, and u64 holds them
+/// until well past any plausible lifetime of this protocol.
+pub fn platform_timestamp_micros() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::UNIX_EPOCH
+            .elapsed()
+            .map(|elapsed| elapsed.as_micros() as u64)
+            .unwrap_or(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // js_sys::Date::now() returns milliseconds since epoch, as an f64 that
+        // is exact to the millisecond well beyond 2^53.
+        (js_sys::Date::now() * 1000.0) as u64
+    }
+}
+
 #[async_trait]
 pub trait MessageMetadata: Debug + Send + Sync + 'static {
     type PeerId: Default
@@ -144,6 +169,27 @@ pub trait MessageMetadata: Debug + Send + Sync + 'static {
         message_id: Self::MessageId,
         contents: impl Into<Self::Contents>,
     ) -> Self;
+
+    /// The id to start a fresh conversation with a peer at.
+    ///
+    /// Zero -- `Default::default()`, which is what this used to be implicitly --
+    /// is the obvious choice and is a bug. A peer that loses its store re-mints
+    /// from that value, while the RECEIVER's durable `last_delivered` frontier
+    /// for that sender is still high. Every re-minted message is therefore at or
+    /// below the frontier, `safe_to_ack` calls it a duplicate, it is re-ACKed
+    /// and cleared, and none of them is ever delivered. Silent, permanent, and
+    /// reachable by an ordinary user action: a new device, or cleared site data.
+    ///
+    /// An implementation must return something that does not go BACKWARDS
+    /// across a lost store -- a wall-clock-derived value, for instance. See
+    /// `platform_timestamp_micros` for why seconds are not enough.
+    ///
+    /// Returning a constant is correct only where the store cannot be lost
+    /// independently of the peer's, which is true of an in-process test and of
+    /// nothing else. It has no default here for exactly that reason: the safe
+    /// answer depends on the deployment, and a default would pick the dangerous
+    /// one for everybody.
+    fn initial_message_id() -> Self::MessageId;
 }
 
 #[async_trait]

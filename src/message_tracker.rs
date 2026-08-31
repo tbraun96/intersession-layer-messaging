@@ -296,7 +296,13 @@ where
     }
 
     pub async fn get_next_id(&self, peer_id: M::PeerId) -> Result<M::MessageId, BackendError<M>> {
-        let mut entry = self.next_unique_id.entry(peer_id).or_default();
+        // Seeded, not zeroed. See `MessageMetadata::initial_message_id`: a
+        // store loss that re-minted from zero had every message swallowed by
+        // the receiver's surviving delivery frontier.
+        let mut entry = self
+            .next_unique_id
+            .entry(peer_id)
+            .or_insert_with(M::initial_message_id);
         let current = *entry;
         *entry = current + M::MessageId::one();
         drop(entry);
