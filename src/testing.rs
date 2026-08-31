@@ -27,6 +27,10 @@ pub struct InMemoryBackend<M: MessageMetadata> {
     /// write, so this counts round trips, not messages -- which is the thing a
     /// cumulative ACK used to multiply.
     clear_ops: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many key/value store OPERATIONS have been issued -- one per call,
+    /// whether it writes one key or five. Counts round trips, which is what the
+    /// inbound path pays per message.
+    store_ops: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(not(target_arch = "wasm32"))]
     random_dir: std::path::PathBuf,
     #[cfg(target_arch = "wasm32")]
@@ -37,6 +41,11 @@ type Mailbox<PeerId, MessageId, Message> = Arc<RwLock<HashMap<(PeerId, MessageId
 
 impl<M: MessageMetadata> InMemoryBackend<M> {
     /// How many times the pending queues have been read. See the field.
+    /// How many key/value store operations have been issued. See the field.
+    pub fn store_ops(&self) -> usize {
+        self.store_ops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many outbound-clear operations have been issued. See the field.
     pub fn clear_ops(&self) -> usize {
         self.clear_ops.load(std::sync::atomic::Ordering::Relaxed)
@@ -61,6 +70,7 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
             inbound: Arc::new(RwLock::new(HashMap::new())),
             reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             clear_ops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            store_ops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(not(target_arch = "wasm32"))]
             random_dir,
             #[cfg(target_arch = "wasm32")]
@@ -187,39 +197,29 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
         Ok(inbound.values().cloned().collect())
     }
 
+    async fn store_values_batched(
+        &self,
+        entries: &[(&str, Vec<u8>)],
+    ) -> Result<(), BackendError<M>> {
+        // One operation for the whole set. The in-memory backend is not the one
+        // the batching exists for, but counting it as ONE is what lets a test
+        // measure round trips rather than keys.
+        self.store_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for (key, value) in entries {
+            self.store_value_inner(key, value).await?;
+        }
+        Ok(())
+    }
+
     async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Store the bytes to the temp directory + key.bin
-            let path = self.random_dir.join(format!("{key}.bin"));
-            std::fs::write(path, value).map_err(|err| BackendError::StorageError(err.to_string()))
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Store in memory for WASM
-            let mut store = self.key_value_store.write().await;
-            store.insert(key.to_string(), value.to_vec());
-            Ok(())
-        }
+        self.store_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.store_value_inner(key, value).await
     }
 
     async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Load the bytes from the temp directory + key.bin
-            let path = self.random_dir.join(format!("{key}.bin"));
-            match std::fs::read(path) {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(BackendError::StorageError(err.to_string())),
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Load from memory for WASM
-            let store = self.key_value_store.read().await;
-            Ok(store.get(key).cloned())
-        }
+        self.load_value_inner(key).await
     }
 }
 
@@ -392,6 +392,44 @@ impl MessageMetadata for TestMessage {
             destination_id,
             message_id,
             contents: contents.into(),
+        }
+    }
+}
+
+impl<M: MessageMetadata> InMemoryBackend<M> {
+    /// The actual write. Split from the trait method so
+    /// `store_values_batched` can reuse it without counting a second
+    /// operation -- the counter measures ROUND TRIPS, not keys.
+    async fn store_value_inner(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>> {
+        {
+            // Store the bytes to the temp directory + key.bin
+            let path = self.random_dir.join(format!("{key}.bin"));
+            std::fs::write(path, value).map_err(|err| BackendError::StorageError(err.to_string()))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Store in memory for WASM
+            let mut store = self.key_value_store.write().await;
+            store.insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+    }
+    async fn load_value_inner(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Load the bytes from the temp directory + key.bin
+            let path = self.random_dir.join(format!("{key}.bin"));
+            match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(BackendError::StorageError(err.to_string())),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Load from memory for WASM
+            let store = self.key_value_store.read().await;
+            Ok(store.get(key).cloned())
         }
     }
 }
@@ -1127,6 +1165,12 @@ mod tests {
                 &self,
                 _: usize,
                 _: usize,
+            ) -> Result<(), BackendError<TestMessage>> {
+                Err(BackendError::StorageError("Simulated failure".into()))
+            }
+            async fn store_values_batched(
+                &self,
+                _: &[(&str, Vec<u8>)],
             ) -> Result<(), BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }

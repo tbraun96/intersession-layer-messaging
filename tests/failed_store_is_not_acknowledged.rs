@@ -70,6 +70,12 @@ impl Backend<TestMessage> for FlakyStore {
     ) -> Result<(), BackendError<TestMessage>> {
         self.inner.clear_message_outbound(peer_id, message_id).await
     }
+    async fn store_values_batched(
+        &self,
+        entries: &[(&str, Vec<u8>)],
+    ) -> Result<(), BackendError<TestMessage>> {
+        self.inner.store_values_batched(entries).await
+    }
     async fn clear_messages_outbound(
         &self,
         peer_id: usize,

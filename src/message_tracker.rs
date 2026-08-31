@@ -522,6 +522,60 @@ where
             || self.has_delivered.contains_key(&(peer_id, msg_id))
     }
 
+    /// Record that a message arrived: the receipt (which is both the dedup
+    /// record and the gap-patience clock) and the per-peer high-water mark, in
+    /// ONE store round trip.
+    ///
+    /// These were two calls, `mark_received` then `update_last_received_from`,
+    /// each serializing its own map and awaiting its own acknowledgement. That
+    /// is two round trips per arriving message, inline in the single sequential
+    /// listener -- and each is a five-second window in which one lost response
+    /// freezes ALL inbound processing, ACKs included, so the senders retransmit
+    /// into a receiver that has stopped reading.
+    ///
+    /// Returns whether this is the first time the message has been seen, which
+    /// is what the caller uses to decide between delivering and re-ACKing.
+    pub async fn record_arrival(
+        &self,
+        peer_id: M::PeerId,
+        msg_id: M::MessageId,
+    ) -> Result<bool, BackendError<M>> {
+        if self.received_messages.contains_key(&(peer_id, msg_id))
+            || self.has_delivered.contains_key(&(peer_id, msg_id))
+        {
+            return Ok(false);
+        }
+
+        let _ = self
+            .received_messages
+            .insert((peer_id, msg_id), platform_timestamp_secs());
+        self.drop_lru_if_full();
+
+        // Only the maps that actually changed are written. The high-water mark
+        // moves only forwards, exactly as it did when it was its own call.
+        let advances_high_water = match self.last_received_from.get(&peer_id) {
+            Some(current) => msg_id > *current,
+            None => true,
+        };
+        if advances_high_water {
+            self.last_received_from.insert(peer_id, msg_id);
+        }
+
+        let mut entries: Vec<(&str, Vec<u8>)> = vec![(
+            "received_messages",
+            bincode2::serialize(&self.received_messages).unwrap(),
+        )];
+        if advances_high_water {
+            entries.push((
+                "last_received_from",
+                bincode2::serialize(&self.last_received_from).unwrap(),
+            ));
+        }
+
+        self.backend.store_values_batched(&entries).await?;
+        Ok(true)
+    }
+
     pub async fn mark_received(
         &self,
         peer_id: M::PeerId,
@@ -678,34 +732,33 @@ where
 
     // Sync all states to the backend
     pub async fn sync_backend(&self) -> Result<(), BackendError<M>> {
-        self.backend
-            .store_value(
-                "last_acked",
-                &bincode2::serialize(&self.last_acked).unwrap(),
-            )
-            .await?;
-        self.backend
-            .store_value("last_sent", &bincode2::serialize(&self.last_sent).unwrap())
-            .await?;
-        self.backend
-            .store_value(
+        // ONE round trip for all five maps, not five.
+        //
+        // This is called on the ACK path and on the delivery path, i.e. for
+        // ordinary traffic, and it ran inline in the single sequential
+        // listener. Five sequential `store_value` awaits is five separate
+        // five-second `wait_for_response` windows per call: one lost response
+        // froze ALL inbound processing -- ACKs included -- and the senders
+        // began retransmitting into a receiver that had stopped reading. The
+        // maps were also written one at a time, so a failure partway through
+        // left the persisted set inconsistent with itself.
+        let entries: Vec<(&str, Vec<u8>)> = vec![
+            ("last_acked", bincode2::serialize(&self.last_acked).unwrap()),
+            ("last_sent", bincode2::serialize(&self.last_sent).unwrap()),
+            (
                 "next_unique_id",
-                &bincode2::serialize(&self.next_unique_id).unwrap(),
-            )
-            .await?;
-        self.backend
-            .store_value(
+                bincode2::serialize(&self.next_unique_id).unwrap(),
+            ),
+            (
                 "received_messages",
-                &bincode2::serialize(&self.received_messages).unwrap(),
-            )
-            .await?;
-        self.backend
-            .store_value(
+                bincode2::serialize(&self.received_messages).unwrap(),
+            ),
+            (
                 "last_received_from",
-                &bincode2::serialize(&self.last_received_from).unwrap(),
-            )
-            .await?;
-        Ok(())
+                bincode2::serialize(&self.last_received_from).unwrap(),
+            ),
+        ];
+        self.backend.store_values_batched(&entries).await
     }
 }
 

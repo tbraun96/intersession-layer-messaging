@@ -263,6 +263,23 @@ pub trait Backend<M: MessageMetadata>: Send + Sync {
     async fn store_value(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>>;
     async fn load_value(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>>;
 
+    /// Store several key/value pairs in ONE operation.
+    ///
+    /// Deliberately has no default implementation, for the same reason as
+    /// `clear_messages_outbound`: a default that looped over `store_value`
+    /// would compile everywhere and leave every backend paying a round trip per
+    /// key, which is the cost this exists to remove, and nothing would say so.
+    ///
+    /// The inbound path is why. Every arriving message writes the receipt map
+    /// and the per-peer high-water mark, and it does so inline in the single
+    /// sequential listener -- so each extra round trip is another 5s window in
+    /// which one lost response freezes ALL inbound processing, ACKs included,
+    /// and the senders start retransmitting.
+    async fn store_values_batched(
+        &self,
+        entries: &[(&str, Vec<u8>)],
+    ) -> Result<(), BackendError<M>>;
+
     /// Load multiple values in a single batched operation.
     /// Default implementation calls load_value() sequentially for backwards compatibility.
     /// Implementations should override this with a batched network call to avoid
@@ -1429,17 +1446,10 @@ where
                             // sender un-ACKed is what makes this recoverable.
                             log::error!(target: "ism", "Failed to store inbound message, leaving it unacknowledged so the sender retries: {e:?}");
                         } else {
-                            if let Err(e) = self.tracker.mark_received(source_id, message_id).await
+                            // One store round trip, not two. See `record_arrival`.
+                            if let Err(e) = self.tracker.record_arrival(source_id, message_id).await
                             {
-                                log::error!(target: "ism", "Failed to mark message as received: {e:?}");
-                            }
-
-                            if let Err(e) = self
-                                .tracker
-                                .update_last_received_from(source_id, message_id)
-                                .await
-                            {
-                                log::error!(target: "ism", "Failed to update last_received_from: {e:?}");
+                                log::error!(target: "ism", "Failed to record the arrival of msg_id={message_id} from {source_id}: {e:?}");
                             }
 
                             if self.poll_inbound_tx.send(()).is_err() {
