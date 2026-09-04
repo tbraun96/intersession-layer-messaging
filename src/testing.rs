@@ -1938,8 +1938,14 @@ mod tests {
     /// isolation. Only the send legs are accumulated; the idle sleeps are not.
     ///
     /// Measured over 8 rounds: ~13ms total with the nudge, ~1130ms without
-    /// (uniform 0..200ms each, mean ~140 here). The 200ms bound sits 15x above
-    /// the former and 5x below the latter.
+    /// (uniform 0..200ms each). The bound was once on that TOTAL, at 200ms --
+    /// a 25ms average -- which a merely slow runner failed while the message
+    /// claimed every send had waited out the poll. That was arithmetically
+    /// impossible: eight poll-waits total ~1130ms, and the failing run measured
+    /// 297ms. It reported a nudge failure whenever CI was loaded.
+    ///
+    /// The bound is now on the WORST leg, at POLL/2, which separates the two
+    /// causes instead of conflating them. See the assertion for the derivation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_send_after_idle_does_not_wait_for_the_outbound_poll_timer() {
         setup_log();
@@ -1963,7 +1969,10 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         const ROUNDS: usize = 8;
+        // The outbound poll this test exists to prove we do NOT wait for.
+        const POLL: Duration = Duration::from_millis(200);
         let mut sending = Duration::ZERO;
+        let mut worst = Duration::ZERO;
 
         for id in 0..ROUNDS {
             // Go quiet: longer than one poll interval, so any nudge left over
@@ -1985,16 +1994,46 @@ mod tests {
                 .await
                 .expect("peer 2 should receive within 5s")
                 .expect("channel open");
-            sending += started.elapsed();
+            let leg = started.elapsed();
+            sending += leg;
+            worst = worst.max(leg);
 
             assert_eq!(received.message_id(), id);
         }
 
-        println!("MEASURED send legs total={sending:?} over {ROUNDS} idle rounds");
+        println!("MEASURED send legs total={sending:?} worst={worst:?} over {ROUNDS} idle rounds");
+
+        // Assert on the WORST leg, not the total.
+        //
+        // The total could not tell the two failures apart. Its budget was 200ms
+        // for 8 legs -- a 25ms average -- so a merely slow runner failed it
+        // while claiming, in the message, that "each one waited out the 200ms
+        // outbound poll". That claim was arithmetically impossible: eight
+        // poll-waits would total ~1600ms, and the run that failed measured
+        // 297ms. It was reporting a nudge failure whenever CI was loaded.
+        //
+        // The worst leg discriminates. A working nudge sends on the round trip,
+        // so every leg is milliseconds and a slow runner adds milliseconds. A
+        // failed nudge parks that leg on the poll timer, which costs ~POLL. The
+        // bar sits below POLL so a partial wait is caught too, and far above
+        // any plausible round trip.
+        // The bar is POLL/2, and that number is derived rather than picked.
+        //
+        // A failed nudge parks the send on the poll timer, so its leg lands
+        // uniformly in 0..POLL -- mean POLL/2. A bar at POLL/2 therefore catches
+        // any single failed leg with probability ~0.5, and across ROUNDS legs
+        // with probability 1 - 0.5^8, about 99.6%.
+        //
+        // A working nudge sends on the round trip: ~1.6ms per leg on the
+        // author's machine, ~37ms on the loaded CI runner that exposed the old
+        // assertion. POLL/2 is 100ms, so the bar sits ~2.7x above the slowest
+        // leg ever observed working, and a slow runner adds milliseconds rather
+        // than the ~100ms a failed nudge costs.
         assert!(
-            sending < Duration::from_millis(200),
-            "{ROUNDS} sends from an idle loop took {sending:?} in total; each one \
-             waited out the 200ms outbound poll instead of being sent on the nudge"
+            worst < POLL / 2,
+            "one of {ROUNDS} sends from an idle loop took {worst:?} (total {sending:?}); \
+             a leg that long waited on the {POLL:?} outbound poll instead of being \
+             sent on the nudge"
         );
     }
 
