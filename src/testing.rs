@@ -2003,6 +2003,33 @@ mod tests {
 
         println!("MEASURED send legs total={sending:?} worst={worst:?} over {ROUNDS} idle rounds");
 
+        // Persist the measurement where the log cannot lose it.
+        //
+        // The first failure of this bound on macOS and Windows CI produced NO
+        // number: nextest captures stdout and truncates it before the panic,
+        // and the same was true of the full run archive. So the failure could
+        // not be attributed -- a too-tight bar, or a genuinely slow platform --
+        // and a bound cannot be tuned against a value nobody can read. The
+        // workflow uploads this file as an artifact on failure.
+        //
+        // Anchored to CARGO_MANIFEST_DIR, not the cwd's `target`: inside the
+        // consuming workspace cargo's target dir is the workspace's, so a bare
+        // "target" wrote nowhere and -- because the first version discarded the
+        // Result -- said nothing about it. The write's outcome is printed
+        // either way; a diagnostic that fails silently is no diagnostic.
+        {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            let path = dir.join("idle-send-measurement.txt");
+            let body = format!(
+                "rounds={ROUNDS}\nidle_total={sending:?}\nworst_leg={worst:?}\npoll={POLL:?}\nbar={:?}\n",
+                POLL / 2
+            );
+            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, body)) {
+                Ok(()) => eprintln!("MEASUREMENT written to {}", path.display()),
+                Err(e) => eprintln!("MEASUREMENT NOT written to {}: {e}", path.display()),
+            }
+        }
+
         // Assert on the WORST leg, not the total.
         //
         // The total could not tell the two failures apart. Its budget was 200ms
