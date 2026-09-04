@@ -20,6 +20,11 @@ env:
 jobs:
   tests:
     strategy:
+      # Windows never reported. When macOS failed, the default fail-fast
+      # cancelled Windows mid-`nextest run`, so what the PR showed as a Windows
+      # failure was a cancellation with no test output and no artifact. Each
+      # platform must finish on its own so its measurement gets uploaded.
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
     runs-on: ${{ matrix.os }}
@@ -28,6 +33,16 @@ jobs:
       - uses: Avarok-Cybersecurity/gh-actions-deps@master
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --features=testing
+      # The idle-send timing test writes its measurement to a file, because
+      # nextest truncates captured stdout before the panic and the first
+      # macOS/Windows failure produced no number at all. Uploaded on failure
+      # so the bound can be judged against a value rather than a guess.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idle-send-measurement-${{ matrix.os }}
+          path: target/idle-send-measurement.txt
+          if-no-files-found: ignore
 
   clippy:
     runs-on: ubuntu-latest
