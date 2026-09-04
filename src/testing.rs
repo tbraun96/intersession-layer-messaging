@@ -1971,6 +1971,27 @@ mod tests {
         const ROUNDS: usize = 8;
         // The outbound poll this test exists to prove we do NOT wait for.
         const POLL: Duration = Duration::from_millis(200);
+
+        // Evidence that survives a panic mid-loop.
+        //
+        // On macOS CI this test took 6.44s and left no measurement file: a
+        // 5s receive timeout inside the loop panicked BEFORE the summary was
+        // written, so the failure looked like the timing bound when it was a
+        // message that never arrived. Appending after every leg -- and on the
+        // timeout itself -- means whatever kills the test, the file says how
+        // far it got and what each leg cost. The workflow uploads it.
+        let record_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("idle-send-measurement.txt");
+        let _ = std::fs::create_dir_all(record_path.parent().unwrap());
+        let _ = std::fs::write(&record_path, format!("rounds={ROUNDS} poll={POLL:?} bar={:?}\n", POLL / 2));
+        let record = |line: String| {
+            use std::io::Write;
+            match std::fs::OpenOptions::new().append(true).open(&record_path) {
+                Ok(mut f) => { let _ = writeln!(f, "{line}"); }
+                Err(e) => eprintln!("MEASUREMENT NOT recorded ({e}): {line}"),
+            }
+        };
         let mut sending = Duration::ZERO;
         let mut worst = Duration::ZERO;
 
@@ -1990,11 +2011,15 @@ mod tests {
             .await
             .unwrap();
 
-            let received = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
-                .await
-                .expect("peer 2 should receive within 5s")
-                .expect("channel open");
+            let received = match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
+                Ok(msg) => msg.expect("channel open"),
+                Err(_) => {
+                    record(format!("leg={id} TIMED OUT after 5s (elapsed {:?})", started.elapsed()));
+                    panic!("peer 2 should receive within 5s (leg {id})");
+                }
+            };
             let leg = started.elapsed();
+            record(format!("leg={id} {leg:?}"));
             sending += leg;
             worst = worst.max(leg);
 
@@ -2003,32 +2028,8 @@ mod tests {
 
         println!("MEASURED send legs total={sending:?} worst={worst:?} over {ROUNDS} idle rounds");
 
-        // Persist the measurement where the log cannot lose it.
-        //
-        // The first failure of this bound on macOS and Windows CI produced NO
-        // number: nextest captures stdout and truncates it before the panic,
-        // and the same was true of the full run archive. So the failure could
-        // not be attributed -- a too-tight bar, or a genuinely slow platform --
-        // and a bound cannot be tuned against a value nobody can read. The
-        // workflow uploads this file as an artifact on failure.
-        //
-        // Anchored to CARGO_MANIFEST_DIR, not the cwd's `target`: inside the
-        // consuming workspace cargo's target dir is the workspace's, so a bare
-        // "target" wrote nowhere and -- because the first version discarded the
-        // Result -- said nothing about it. The write's outcome is printed
-        // either way; a diagnostic that fails silently is no diagnostic.
-        {
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-            let path = dir.join("idle-send-measurement.txt");
-            let body = format!(
-                "rounds={ROUNDS}\nidle_total={sending:?}\nworst_leg={worst:?}\npoll={POLL:?}\nbar={:?}\n",
-                POLL / 2
-            );
-            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, body)) {
-                Ok(()) => eprintln!("MEASUREMENT written to {}", path.display()),
-                Err(e) => eprintln!("MEASUREMENT NOT written to {}: {e}", path.display()),
-            }
-        }
+        record(format!("idle_total={sending:?} worst_leg={worst:?}"));
+        eprintln!("MEASUREMENT recorded to {}", record_path.display());
 
         // Assert on the WORST leg, not the total.
         //
