@@ -1984,11 +1984,16 @@ mod tests {
             .join("target")
             .join("idle-send-measurement.txt");
         let _ = std::fs::create_dir_all(record_path.parent().unwrap());
-        let _ = std::fs::write(&record_path, format!("rounds={ROUNDS} poll={POLL:?} bar={:?}\n", POLL / 2));
+        let _ = std::fs::write(
+            &record_path,
+            format!("rounds={ROUNDS} poll={POLL:?} bar={:?}\n", POLL / 2),
+        );
         let record = |line: String| {
             use std::io::Write;
             match std::fs::OpenOptions::new().append(true).open(&record_path) {
-                Ok(mut f) => { let _ = writeln!(f, "{line}"); }
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{line}");
+                }
                 Err(e) => eprintln!("MEASUREMENT NOT recorded ({e}): {line}"),
             }
         };
@@ -2014,7 +2019,10 @@ mod tests {
             let received = match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
                 Ok(msg) => msg.expect("channel open"),
                 Err(_) => {
-                    record(format!("leg={id} TIMED OUT after 5s (elapsed {:?})", started.elapsed()));
+                    record(format!(
+                        "leg={id} TIMED OUT after 5s (elapsed {:?})",
+                        started.elapsed()
+                    ));
                     panic!("peer 2 should receive within 5s (leg {id})");
                 }
             };
