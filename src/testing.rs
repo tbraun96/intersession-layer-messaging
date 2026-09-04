@@ -2336,4 +2336,62 @@ mod tests {
             }
         }
     }
+
+    /// Walks the idle sleep across the 200ms outbound timer so that a send
+    /// lands at every phase relative to a timer tick, including ON it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sends_landing_on_a_timer_tick_are_not_stranded() {
+        // Same two-peer setup as the idle-send test above, verbatim.
+
+        setup_log();
+
+        let network1 = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
+        let network2 = network1.add_peer(2).await;
+
+        let backend1 = InMemoryBackend::<TestMessage>::default();
+        let backend2 = InMemoryBackend::<TestMessage>::default();
+
+        let (tx1, mut _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+
+        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone())
+            .await
+            .unwrap();
+        let _ilm2 = ILM::new(backend2.clone(), tx2, network2.clone())
+            .await
+            .unwrap();
+        let mut stranded = Vec::new();
+        for i in 0..120u64 {
+            let idle = Duration::from_millis(190 + (i % 21)); // 190..210ms, 1ms steps across the tick
+            crate::platform_sleep(idle).await;
+            let started = std::time::Instant::now();
+            // A refusal here IS the symptom one leg late: a stranded message
+            // is never acked, so the queue stays occupied and the next send is
+            // turned away. Record it rather than unwrap, so the assert below
+            // names it instead of a bare panic hiding the earlier strand.
+            if let Err(e) = ilm1
+                .send_raw_message(TestMessage {
+                    source_id: 1,
+                    destination_id: 2,
+                    message_id: 1000 + i as usize,
+                    contents: vec![1],
+                })
+                .await
+            {
+                stranded.push((i, idle, started.elapsed(), format!("send refused: {e:?}")));
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(1500), rx2.recv()).await {
+                Ok(Some(m)) => assert_eq!(m.message_id(), 1000 + i as usize),
+                _ => {
+                    stranded.push((i, idle, started.elapsed(), "never received".into()));
+                    break;
+                }
+            }
+        }
+        assert!(
+            stranded.is_empty(),
+            "stranded sends (idx, idle, waited): {stranded:?}"
+        );
+    }
 }
