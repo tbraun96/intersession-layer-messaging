@@ -1201,10 +1201,23 @@ mod tests {
             ) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
                 Err(BackendError::StorageError("Simulated failure".into()))
             }
+            /// Succeeds, reporting nothing pending.
+            ///
+            /// This used to fail like the rest, and construction tolerated it --
+            /// which is the defect: `MessageTracker::new` seeds its delivery
+            /// frontier from "which peers have nothing pending inbound", so a
+            /// FAILED read looked like "nobody has anything pending" and every
+            /// peer got the seed. An undelivered message was then claimed as
+            /// delivered, ACKed and cleared.
+            ///
+            /// Construction now refuses when this read fails, which is asserted
+            /// separately in `a_tracker_that_cannot_read_what_is_pending_refuses`.
+            /// This test is about a backend that cannot WRITE, so the read that
+            /// gates construction has to succeed for it to reach its subject.
             async fn get_pending_inbound(
                 &self,
             ) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
-                Err(BackendError::StorageError("Simulated failure".into()))
+                Ok(Vec::new())
             }
 
             async fn store_value(
