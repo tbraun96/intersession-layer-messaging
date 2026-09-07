@@ -990,18 +990,32 @@ mod tests {
         };
 
         // Create tasks for receiving messages
+        // One deadline, named once. The panic messages below quote it, and a
+        // literal "5s" in the text would keep saying 5s after somebody changed
+        // the Duration -- which is how a diagnostic comes to describe a run
+        // that did not happen.
+        const RECV_DEADLINE: Duration = Duration::from_secs(5);
+
         let receive_task1 = citadel_io::tokio::spawn(async move {
             let mut received = 0;
             while received < NUM_MESSAGES {
                 if let Ok(Some(msg)) =
-                    citadel_io::tokio::time::timeout(Duration::from_secs(5), rx1.recv()).await
+                    citadel_io::tokio::time::timeout(RECV_DEADLINE, rx1.recv()).await
                 {
                     assert_eq!(msg.source_id(), 2);
                     assert_eq!(msg.destination_id(), 1);
                     assert_eq!(msg.contents(), &[received]);
                     received += 1;
                 } else {
-                    panic!("Timeout waiting for messages at peer 1");
+                    // How far it got is the whole diagnosis. This said only
+                    // "Timeout", so a CI failure could not distinguish a system
+                    // that delivered nothing from one that stalled on the last
+                    // message -- and this test is intermittent on loaded runners,
+                    // where that difference is the finding.
+                    panic!(
+                        "Timeout at peer 1: received {received} of {NUM_MESSAGES} \
+                         from peer 2 (waited {RECV_DEADLINE:?} for message {received})"
+                    );
                 }
             }
         });
@@ -1010,14 +1024,22 @@ mod tests {
             let mut received = 0;
             while received < NUM_MESSAGES {
                 if let Ok(Some(msg)) =
-                    citadel_io::tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await
+                    citadel_io::tokio::time::timeout(RECV_DEADLINE, rx2.recv()).await
                 {
                     assert_eq!(msg.source_id(), 1);
                     assert_eq!(msg.destination_id(), 2);
                     assert_eq!(msg.contents(), &[received]);
                     received += 1;
                 } else {
-                    panic!("Timeout waiting for messages at peer 2");
+                    // How far it got is the whole diagnosis. This said only
+                    // "Timeout", so a CI failure could not distinguish a system
+                    // that delivered nothing from one that stalled on the last
+                    // message -- and this test is intermittent on loaded runners,
+                    // where that difference is the finding.
+                    panic!(
+                        "Timeout at peer 2: received {received} of {NUM_MESSAGES} \
+                         from peer 1 (waited {RECV_DEADLINE:?} for message {received})"
+                    );
                 }
             }
         });
