@@ -595,7 +595,22 @@ where
                     // Coalesce a burst: every queued nudge asks for the same
                     // drain, and process_outbound below sends everything
                     // pending regardless of how many asked.
-                    while poll_outbound_rx.try_recv().is_ok() {}
+                    //
+                    // But a drained nudge is still a nudge. This drain runs on
+                    // EVERY wake, including a timer tick -- and the skip just
+                    // below discards a timer tick when the hint says the queue
+                    // was empty. So a nudge that landed while the loop was
+                    // parked, if the timer fired at nearly the same instant and
+                    // won the select, was eaten here and then thrown away
+                    // there: the message sat stored, the hint stayed false,
+                    // and every later tick skipped the read. A lost wakeup,
+                    // permanent until some unrelated nudge arrived. On a
+                    // loaded 3-core macOS runner the window was wide enough to
+                    // hit on every run, at a different leg each time.
+                    let mut wake = wake;
+                    while poll_outbound_rx.try_recv().is_ok() {
+                        wake = Wake::Nudged;
+                    }
 
                     // An idle session used to pay a full queue read ten times a
                     // second to be told there was nothing to send. Retransmission
@@ -1615,6 +1630,11 @@ where
             //
             // The loop also drains queued nudges before draining the backend, so
             // a burst of sends costs one pass, not one pass per message.
+            // Belt to the fix above's braces: the hint is the durable state and
+            // the nudge only the wake, so a stored message marks the queue as
+            // possibly non-empty itself rather than relying on its nudge being
+            // the wake that happens to win the select.
+            self.outbound_may_have_work.store(true, Ordering::Relaxed);
             let _ = self.poll_outbound_tx.send(());
             Ok(())
         } else {
