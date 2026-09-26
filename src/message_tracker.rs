@@ -158,11 +158,19 @@ where
         // left unset and the lowest pending id starts the run -- which is the
         // right answer for an upgrade, because under one-in-flight the lowest
         // undelivered id is exactly where the old build stopped.
-        let still_pending = tracker
-            .backend
-            .get_pending_inbound()
-            .await
-            .unwrap_or_default();
+        // Propagated, not defaulted.
+        //
+        // `unwrap_or_default()` turned a FAILED query into an empty vec, which
+        // reads as "no peer has anything pending" -- so the seed above was applied
+        // to every peer, which is precisely the case the comment says it must not
+        // be. An undelivered message is then claimed as delivered, ACKed and
+        // cleared, and the sender never retransmits it.
+        //
+        // `new` already returns `Result` and its only production caller uses `?`,
+        // so refusing costs nothing: a tracker that cannot read what is pending
+        // has no basis for deciding what was delivered, and starting anyway is
+        // how the decision gets made on evidence that was never read.
+        let still_pending = tracker.backend.get_pending_inbound().await?;
         let mut has_pending: std::collections::HashSet<M::PeerId> =
             std::collections::HashSet::new();
         for message in &still_pending {
@@ -886,6 +894,161 @@ mod bounded_maps_tests {
         assert!(
             !tracker.has_delivered.contains_key(&(PEER, 0)),
             "the oldest id survived, so eviction is not by age"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_reads_what_it_needs {
+    //! A tracker that cannot read what is pending must not decide what was delivered.
+    //!
+    //! `MessageTracker::new` seeds its delivery frontier from `last_received_from`,
+    //! but ONLY for peers with nothing still pending inbound — for those, everything
+    //! received was delivered by definition. The comment on that seed is explicit
+    //! that this is the one case where it is provably true.
+    //!
+    //! `get_pending_inbound().await.unwrap_or_default()` broke exactly that. A
+    //! FAILED query yielded an empty vec, which reads as "no peer has anything
+    //! pending", so the seed was applied to every peer. A message that had been
+    //! received but not yet delivered was then claimed as delivered — ACKed,
+    //! cleared, and never retransmitted. Silent loss, from an error nobody saw.
+
+    use super::MessageTracker;
+    use crate::testing::TestMessage;
+    use crate::{Backend, BackendError};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    /// Reads fail; everything else is fine. Narrow on purpose: a backend that
+    /// failed everything would refuse construction for several reasons at once,
+    /// and this asserts which one.
+    struct PendingInboundUnreadable;
+
+    #[async_trait]
+    impl Backend<TestMessage> for PendingInboundUnreadable {
+        async fn get_pending_inbound(&self) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
+            Err(BackendError::StorageError("backend unavailable".into()))
+        }
+        async fn get_pending_outbound(
+            &self,
+        ) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
+            Ok(Vec::new())
+        }
+        async fn store_outbound(&self, _: TestMessage) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn store_inbound(&self, _: TestMessage) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn clear_message_inbound(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn clear_message_outbound(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn store_values_batched(
+            &self,
+            _: &[(&str, Vec<u8>)],
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn clear_messages_outbound(
+            &self,
+            _: usize,
+            _: &[usize],
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn store_value(&self, _: &str, _: &[u8]) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn load_value(&self, _: &str) -> Result<Option<Vec<u8>>, BackendError<TestMessage>> {
+            Ok(None)
+        }
+    }
+
+    /// The same backend with the read working, as the control.
+    struct AllReadable;
+
+    #[async_trait]
+    impl Backend<TestMessage> for AllReadable {
+        async fn get_pending_inbound(&self) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
+            Ok(Vec::new())
+        }
+        async fn get_pending_outbound(
+            &self,
+        ) -> Result<Vec<TestMessage>, BackendError<TestMessage>> {
+            Ok(Vec::new())
+        }
+        async fn store_outbound(&self, _: TestMessage) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn store_inbound(&self, _: TestMessage) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn clear_message_inbound(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn clear_message_outbound(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn store_values_batched(
+            &self,
+            _: &[(&str, Vec<u8>)],
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn clear_messages_outbound(
+            &self,
+            _: usize,
+            _: &[usize],
+        ) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn store_value(&self, _: &str, _: &[u8]) -> Result<(), BackendError<TestMessage>> {
+            Ok(())
+        }
+        async fn load_value(&self, _: &str) -> Result<Option<Vec<u8>>, BackendError<TestMessage>> {
+            Ok(None)
+        }
+    }
+
+    #[citadel_io::tokio::test]
+    async fn a_tracker_that_cannot_read_what_is_pending_refuses() {
+        let result = MessageTracker::new(Arc::new(PendingInboundUnreadable)).await;
+
+        assert!(
+            result.is_err(),
+            "a failed pending-inbound read was treated as 'nothing is pending', which \
+             seeds the delivery frontier for every peer and drops undelivered messages"
+        );
+    }
+
+    #[citadel_io::tokio::test]
+    async fn but_a_readable_backend_still_starts() {
+        // The control. Refusing construction unconditionally would satisfy the
+        // test above and stop the messenger from ever starting.
+        let result = MessageTracker::new(Arc::new(AllReadable)).await;
+
+        assert!(
+            result.is_ok(),
+            "an empty but READABLE backend must still start"
         );
     }
 }
