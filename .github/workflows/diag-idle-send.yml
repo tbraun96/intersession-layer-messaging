@@ -1,0 +1,54 @@
+# DIAGNOSTIC, not for merge. Loops the idle-send timing test on ubuntu-latest, where one leg
+# waited the full 200ms OUTBOUND_POLL (citadel-workspace Publish Images 36299634762) while 540
+# runs on macOS and in a Linux container never did. Each failing iteration keeps its full
+# trace log (RUST_LOG=ism=trace) so the stage that waited can be read from timestamps.
+# Round 2: src/lib.rs on this branch logs [DIAG +Nus] at every hand-off of an idle send.
+# Round 3: plus the receiver's network receive / store / record steps, with thread ids.
+# Round 4: plus a 10ms heartbeat task: gap in it too => whole process paused; no gap => one task starved.
+#   Result: 10/300, heartbeat never gapped -> one task starved.
+# Round 5: same loop with tokio's LIFO slot disabled. Failures gone => LIFO-slot starvation.
+name: diag idle send
+on:
+  pull_request:
+    paths: ['.github/workflows/diag-idle-send.yml']
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_MIN_STACK: 40971520
+  RUST_LOG: "ism=trace"
+  RUSTFLAGS: "--cfg tokio_unstable"
+  DIAG_NO_LIFO: "1"
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: Avarok-Cybersecurity/gh-actions-deps@master
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --features=testing --no-run
+      - name: Loop the idle-send test (300 iterations, full suite every 25th for load)
+        run: |
+          mkdir -p diag
+          fails=0
+          for i in $(seq 1 300); do
+            if [ $((i % 25)) = 0 ]; then filter='all()'; else filter='test(test_send_after_idle_does_not_wait_for_the_outbound_poll_timer)'; fi
+            if ! cargo nextest run --features=testing --no-fail-fast --success-output never --failure-output final -E "$filter" > "diag/run-$i.log" 2>&1; then
+              if grep -q 'FAIL .*test_send_after_idle' "diag/run-$i.log"; then
+                fails=$((fails+1)); cp target/idle-send-measurement.txt "diag/measurement-$i.txt" 2>/dev/null || true
+                echo "iteration $i: idle-send FAILED"
+              else
+                echo "iteration $i: another test failed"
+              fi
+            else
+              rm -f "diag/run-$i.log"
+            fi
+          done
+          echo "idle-send failures: $fails/300"
+          echo "fails=$fails" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: idle-send-diag
+          path: diag/
+          if-no-files-found: ignore

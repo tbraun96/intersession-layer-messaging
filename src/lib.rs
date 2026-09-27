@@ -27,6 +27,15 @@ pub(crate) mod message_tracker;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+// DIAG (branch diag/idle-send-on-ubuntu only): microseconds since first use, to find which
+// stage of an idle send waited on a poll timer instead of a nudge.
+static DIAG_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+macro_rules! diag {
+    ($($arg:tt)*) => {
+        log::info!(target: "ism", "[DIAG +{}us] {}", DIAG_T0.get_or_init(std::time::Instant::now).elapsed().as_micros(), format!($($arg)*))
+    };
+}
+
 const OUTBOUND_POLL: Duration = Duration::from_millis(200);
 const INBOUND_POLL: Duration = Duration::from_millis(200);
 
@@ -607,10 +616,22 @@ where
                     // permanent until some unrelated nudge arrived. On a
                     // loaded 3-core macOS runner the window was wide enough to
                     // hit on every run, at a different leg each time.
+                    let woke_by = if matches!(wake, Wake::Nudged) {
+                        "nudge"
+                    } else {
+                        "timer"
+                    };
                     let mut wake = wake;
+                    let mut drained = 0u32;
                     while poll_outbound_rx.try_recv().is_ok() {
                         wake = Wake::Nudged;
+                        drained += 1;
                     }
+                    diag!(
+                        "[{}] outbound loop woke by {woke_by}, drained {drained}, hint={}",
+                        this.network.local_id(),
+                        this.outbound_may_have_work.load(Ordering::Relaxed)
+                    );
 
                     // An idle session used to pay a full queue read ten times a
                     // second to be told there was nothing to send. Retransmission
@@ -668,6 +689,11 @@ where
                     if !nudged && !this.inbound_may_have_work.load(Ordering::Relaxed) {
                         continue;
                     }
+                    diag!(
+                        "[{}] inbound loop woke by {}",
+                        this.network.local_id(),
+                        if nudged { "nudge" } else { "timer" }
+                    );
 
                     this.process_inbound().await;
                 }
@@ -800,6 +826,11 @@ where
         // queue cannot drift apart.
         self.outbound_may_have_work
             .store(!pending_messages.is_empty(), Ordering::Relaxed);
+        diag!(
+            "[{}] process_outbound read {} pending",
+            self.network.local_id(),
+            pending_messages.len()
+        );
 
         // Group messages by PeerId
         let mut grouped_messages: HashMap<M::PeerId, Vec<M>> = HashMap::new();
@@ -930,6 +961,7 @@ where
                             break 'peer;
                         }
                         log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: SENDING msg_id={message_id}");
+                        diag!("network send msg_id={message_id}");
                         if let Err(e) = self.send_message_internal(Payload::Message(msg)).await {
                             log::error!(target: "ism", "[ILM-SEND] FAILED: {:?}", e);
                             // The wire refused it. Trying the next id would put
@@ -1203,6 +1235,7 @@ where
                     match delivery.deliver(message.clone()).await {
                         Ok(()) => {
                             log::info!(target: "ism", "[ILM-INBOUND] Delivered msg_id={message_id} from peer {peer_id}");
+                            diag!("delivered msg_id={message_id}");
                             self.tracker
                                 .has_delivered
                                 .insert((peer_id, message_id), platform_timestamp_secs());
@@ -1306,6 +1339,14 @@ where
         let Some(message) = self.network.next_message().await else {
             return false;
         };
+        if let Payload::Message(m) = &message {
+            diag!(
+                "[{}] network received msg_id={} on {:?}",
+                self.network.local_id(),
+                m.message_id(),
+                std::thread::current().id()
+            );
+        }
         {
             match message {
                 Payload::Poll {
@@ -1502,7 +1543,12 @@ where
                         let source_id = msg.source_id();
                         let message_id = msg.message_id();
 
-                        if let Err(e) = self.backend.store_inbound(msg).await {
+                        let store_result = self.backend.store_inbound(msg).await;
+                        diag!(
+                            "[{}] stored inbound msg_id={message_id}",
+                            self.network.local_id()
+                        );
+                        if let Err(e) = store_result {
                             // Deliberately NOT marked received: leaving the
                             // sender un-ACKed is what makes this recoverable.
                             log::error!(target: "ism", "Failed to store inbound message, leaving it unacknowledged so the sender retries: {e:?}");
@@ -1512,6 +1558,10 @@ where
                             {
                                 log::error!(target: "ism", "Failed to record the arrival of msg_id={message_id} from {source_id}: {e:?}");
                             }
+                            diag!(
+                                "[{}] recorded arrival msg_id={message_id}",
+                                self.network.local_id()
+                            );
 
                             if self.poll_inbound_tx.send(()).is_err() {
                                 log::warn!(target: "ism", "Failed to send poll signal for inbound messages");
@@ -1635,7 +1685,11 @@ where
             // possibly non-empty itself rather than relying on its nudge being
             // the wake that happens to win the select.
             self.outbound_may_have_work.store(true, Ordering::Relaxed);
-            let _ = self.poll_outbound_tx.send(());
+            let nudged = self.poll_outbound_tx.send(()).is_ok();
+            diag!(
+                "[{}] send_raw_message stored + hint + nudge (ok={nudged})",
+                self.network.local_id()
+            );
             Ok(())
         } else {
             Err(NetworkError::SystemShutdown)
