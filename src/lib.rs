@@ -1339,6 +1339,14 @@ where
         let Some(message) = self.network.next_message().await else {
             return false;
         };
+        if let Payload::Message(m) = &message {
+            diag!(
+                "[{}] network received msg_id={} on {:?}",
+                self.network.local_id(),
+                m.message_id(),
+                std::thread::current().id()
+            );
+        }
         {
             match message {
                 Payload::Poll {
@@ -1535,7 +1543,12 @@ where
                         let source_id = msg.source_id();
                         let message_id = msg.message_id();
 
-                        if let Err(e) = self.backend.store_inbound(msg).await {
+                        let store_result = self.backend.store_inbound(msg).await;
+                        diag!(
+                            "[{}] stored inbound msg_id={message_id}",
+                            self.network.local_id()
+                        );
+                        if let Err(e) = store_result {
                             // Deliberately NOT marked received: leaving the
                             // sender un-ACKed is what makes this recoverable.
                             log::error!(target: "ism", "Failed to store inbound message, leaving it unacknowledged so the sender retries: {e:?}");
@@ -1545,6 +1558,10 @@ where
                             {
                                 log::error!(target: "ism", "Failed to record the arrival of msg_id={message_id} from {source_id}: {e:?}");
                             }
+                            diag!(
+                                "[{}] recorded arrival msg_id={message_id}",
+                                self.network.local_id()
+                            );
 
                             if self.poll_inbound_tx.send(()).is_err() {
                                 log::warn!(target: "ism", "Failed to send poll signal for inbound messages");
