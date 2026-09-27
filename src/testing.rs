@@ -1981,8 +1981,24 @@ mod tests {
     ///
     /// The bound is now on the WORST leg, at POLL/2, which separates the two
     /// causes instead of conflating them. See the assertion for the derivation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_send_after_idle_does_not_wait_for_the_outbound_poll_timer() {
+    // DIAG (branch only): the same 4-worker runtime #[tokio::test] builds, but hand-built so the
+    // LIFO slot can be disabled (DIAG_NO_LIFO=1, needs RUSTFLAGS="--cfg tokio_unstable").
+    #[test]
+    fn test_send_after_idle_does_not_wait_for_the_outbound_poll_timer() {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(4).enable_all();
+        #[cfg(tokio_unstable)]
+        if std::env::var("DIAG_NO_LIFO").as_deref() == Ok("1") {
+            builder.disable_lifo_slot();
+            eprintln!("DIAG: LIFO slot disabled");
+        }
+        builder
+            .build()
+            .unwrap()
+            .block_on(idle_send_does_not_wait_for_the_outbound_poll_timer());
+    }
+
+    async fn idle_send_does_not_wait_for_the_outbound_poll_timer() {
         setup_log();
 
         let network1 = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
