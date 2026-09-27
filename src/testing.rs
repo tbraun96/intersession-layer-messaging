@@ -2003,6 +2003,25 @@ mod tests {
 
         sleep(Duration::from_millis(300)).await;
 
+        // DIAG (branch only): an independent heartbeat. If it keeps ticking through a slow leg,
+        // one ILM task was starved; if it stops too, the whole process was paused.
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticks_hb = ticks.clone();
+        let heartbeat = tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let mut last = t0.elapsed();
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let now = t0.elapsed();
+                let gap = now - last;
+                if gap > Duration::from_millis(40) {
+                    log::info!(target: "ism", "[HEARTBEAT] gap of {gap:?} on {:?}", std::thread::current().id());
+                }
+                last = now;
+                ticks_hb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
         const ROUNDS: usize = 8;
         // The outbound poll this test exists to prove we do NOT wait for.
         const POLL: Duration = Duration::from_millis(200);
@@ -2069,6 +2088,8 @@ mod tests {
             assert_eq!(received.message_id(), id);
         }
 
+        heartbeat.abort();
+        log::info!(target: "ism", "[HEARTBEAT] ticked {} times", ticks.load(std::sync::atomic::Ordering::Relaxed));
         println!("MEASURED send legs total={sending:?} worst={worst:?} over {ROUNDS} idle rounds");
 
         record(format!("idle_total={sending:?} worst_leg={worst:?}"));

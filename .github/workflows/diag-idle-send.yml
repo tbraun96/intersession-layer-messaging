@@ -4,6 +4,7 @@
 # trace log (RUST_LOG=ism=trace) so the stage that waited can be read from timestamps.
 # Round 2: src/lib.rs on this branch logs [DIAG +Nus] at every hand-off of an idle send.
 # Round 3: plus the receiver's network receive / store / record steps, with thread ids.
+# Round 4: plus a 10ms heartbeat task: gap in it too => whole process paused; no gap => one task starved.
 name: diag idle send
 on:
   pull_request:
