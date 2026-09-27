@@ -2,6 +2,7 @@
 # waited the full 200ms OUTBOUND_POLL (citadel-workspace Publish Images 36299634762) while 540
 # runs on macOS and in a Linux container never did. Each failing iteration keeps its full
 # trace log (RUST_LOG=ism=trace) so the stage that waited can be read from timestamps.
+# Round 2: src/lib.rs on this branch logs [DIAG +Nus] at every hand-off of an idle send.
 name: diag idle send
 on:
   pull_request:
