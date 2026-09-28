@@ -6,7 +6,7 @@
 //! transport.
 
 use crate::capabilities::PeerCapabilities;
-use crate::compression::Codec;
+use crate::compression::{CodecSet, CompressionHint};
 use crate::{MessageMetadata, Payload};
 
 /// A payload plus the extensions ILM chose for it.
@@ -38,8 +38,18 @@ pub enum FrameExtensions<Id> {
     /// cannot read, which is why ILM is the only thing that produces it.
     Negotiated {
         piggybacked_ack: Option<Id>,
-        codec: Codec,
+        compression: Option<CompressionPlan>,
     },
+}
+
+/// What a transport needs to compress one data frame: what the application
+/// said the bytes are, and the codecs BOTH ends have. The transport hands
+/// both to `compression::encode`, whose policy table picks the codec for the
+/// frame's actual size -- and sends it raw if nothing would shrink it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionPlan {
+    pub hint: CompressionHint,
+    pub codecs: CodecSet,
 }
 
 /// What the transport learned about the sender from the frame's framing.

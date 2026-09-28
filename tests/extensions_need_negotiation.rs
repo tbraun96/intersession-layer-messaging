@@ -9,8 +9,8 @@ mod support;
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
 use intersession_layer_messaging::{
-    Backend, CompressionHint, DynamicCompression, FrameExtensions, IlmOptions, MessageMetadata,
-    OutboundFrame, Payload, PeerCapabilities, UnderlyingSessionTransport, ILM,
+    Backend, CodecSet, CompressionHint, DynamicCompression, FrameExtensions, IlmOptions,
+    MessageMetadata, OutboundFrame, Payload, PeerCapabilities, UnderlyingSessionTransport, ILM,
 };
 use std::time::Duration;
 use support::{eventually, Kind, Recorder};
@@ -148,11 +148,9 @@ async fn a_peer_that_stops_advertising_is_legacy_again_at_once() {
     };
 
     // Bob advertises piggybacking, and sends Alice something to acknowledge.
-    bob.send_message(poll(Some(PeerCapabilities::from_wire(
-        PeerCapabilities::PIGGYBACK_ACKS,
-    ))))
-    .await
-    .expect("advertise");
+    bob.send_message(poll(Some(PeerCapabilities::new(true, CodecSet::EMPTY))))
+        .await
+        .expect("advertise");
     bob.send_message(message(1)).await.expect("bob sends");
     recv(&mut alice_inbox).await;
     // The ACK is decided just before the inbound row is cleared.

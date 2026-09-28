@@ -53,7 +53,7 @@ async fn a_reply_carries_the_ack_and_retires_the_senders_window() {
         reply.extensions,
         FrameExtensions::Negotiated {
             piggybacked_ack: Some(hello.message_id()),
-            codec: intersession_layer_messaging::Codec::None,
+            compression: None,
         },
         "the reply should have carried the ACK for {}",
         hello.message_id()

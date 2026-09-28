@@ -5,8 +5,8 @@
 //! peer and every frame to it is the legacy frame.
 
 use crate::capabilities::PeerCapabilities;
-use crate::compression::{Codec, CompressionHint};
-use crate::frame::{CapabilityEvidence, FrameExtensions};
+use crate::compression::{can_compress, CompressionHint};
+use crate::frame::{CapabilityEvidence, CompressionPlan, FrameExtensions};
 use crate::options::IlmOptions;
 use crate::MessageMetadata;
 use dashmap::DashMap;
@@ -51,7 +51,7 @@ impl<M: MessageMetadata> Negotiation<M> {
     pub(crate) fn new(options: &IlmOptions) -> Self {
         Self {
             local: PeerCapabilities::local(options),
-            compresses: !options.dynamic_compression.codecs().is_empty(),
+            compresses: !PeerCapabilities::local(options).codecs().is_empty(),
             peers: DashMap::new(),
             pending_acks: DashMap::new(),
             hints: DashMap::new(),
@@ -153,14 +153,19 @@ impl<M: MessageMetadata> Negotiation<M> {
         } else {
             None
         };
-        let hint = self.hints.get(&(peer, id)).map(|hint| *hint);
-        let codec = Codec::for_hint(hint, shared);
-        if piggybacked_ack.is_none() && codec == Codec::None {
+        let codecs = shared.codecs();
+        let compression = self
+            .hints
+            .get(&(peer, id))
+            .map(|hint| *hint)
+            .filter(|hint| can_compress(*hint, codecs))
+            .map(|hint| CompressionPlan { hint, codecs });
+        if piggybacked_ack.is_none() && compression.is_none() {
             FrameExtensions::None
         } else {
             FrameExtensions::Negotiated {
                 piggybacked_ack,
-                codec,
+                compression,
             }
         }
     }

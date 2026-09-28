@@ -11,23 +11,20 @@
 //! exists regardless, so a build without a codec can still NAME it -- to refuse
 //! it with an error rather than misread it.
 
-use crate::capabilities::PeerCapabilities;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 #[cfg(feature = "compression-brotli")]
 mod brotli_codec;
+mod codec;
 #[cfg(feature = "compression-deflate")]
 mod deflate_codec;
 #[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
 mod limit;
+mod policy;
 
-/// Frames smaller than this are sent as they are.
-///
-/// Below it neither codec reliably wins: brotli q4 stops growing input at
-/// about 100 bytes and deflate l1 at about 130, and a frame this small is
-/// dominated by the transport's fixed overhead anyway.
-pub const MIN_COMPRESSIBLE_LEN: usize = 128;
+pub use codec::{Codec, CodecSet, FrameCodec, Params};
+pub use policy::{can_compress, policy, CodecChoice, IDENTITY, SMALL_FRAME_LIMIT};
 
 /// The most a compressed frame may expand to. Also the largest payload a
 /// sender will compress, so a legitimate frame can never be refused by it.
@@ -58,13 +55,6 @@ impl CompressionHint {
             CompressionHint::CborCommand => "cbor-command",
         }
     }
-
-    const fn wants_compression(self) -> bool {
-        matches!(
-            self,
-            CompressionHint::Text | CompressionHint::Json | CompressionHint::YjsUpdate
-        )
-    }
 }
 
 impl FromStr for CompressionHint {
@@ -88,7 +78,8 @@ impl FromStr for CompressionHint {
 ///
 /// A variant exists only when its codec is compiled in, so a configuration
 /// that asks for a codec the build does not have fails to compile rather than
-/// silently sending uncompressed.
+/// silently sending uncompressed. A codec added to the registry gets its own
+/// variant here; `All` picks it up without one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DynamicCompression {
     Disabled,
@@ -96,48 +87,22 @@ pub enum DynamicCompression {
     Brotli,
     #[cfg(feature = "compression-deflate")]
     Deflate,
-    /// Every compiled codec; the strongest the peer also has is used.
+    /// Every compiled codec; `policy` picks among those the peer also has.
     #[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
     All,
 }
 
-/// A codec's id on the wire. Ids are permanent; new codecs take new ids.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Codec {
-    None,
-    Brotli,
-    Deflate,
-}
-
-impl Codec {
-    pub const fn to_wire(self) -> u8 {
+impl DynamicCompression {
+    /// The codecs this setting enables, and so advertises.
+    pub fn codecs(self) -> CodecSet {
         match self {
-            Codec::None => 0,
-            Codec::Brotli => 1,
-            Codec::Deflate => 2,
-        }
-    }
-
-    pub const fn from_wire(id: u8) -> Result<Self, CompressionError> {
-        match id {
-            0 => Ok(Codec::None),
-            1 => Ok(Codec::Brotli),
-            2 => Ok(Codec::Deflate),
-            other => Err(CompressionError::UnknownCodec(other)),
-        }
-    }
-
-    /// The codec for a payload, given what BOTH ends support.
-    ///
-    /// `shared` must already be the intersection of this node's capabilities
-    /// and the peer's; this function has no other way to know either.
-    pub fn for_hint(hint: Option<CompressionHint>, shared: PeerCapabilities) -> Self {
-        match hint {
-            Some(hint) if hint.wants_compression() => [Codec::Brotli, Codec::Deflate]
-                .into_iter()
-                .find(|codec| shared.decodes(*codec))
-                .unwrap_or(Codec::None),
-            _ => Codec::None,
+            DynamicCompression::Disabled => CodecSet::EMPTY,
+            #[cfg(feature = "compression-brotli")]
+            DynamicCompression::Brotli => CodecSet::of(&[Codec::Brotli]),
+            #[cfg(feature = "compression-deflate")]
+            DynamicCompression::Deflate => CodecSet::of(&[Codec::Deflate]),
+            #[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
+            DynamicCompression::All => CodecSet::compiled(),
         }
     }
 }
@@ -183,57 +148,57 @@ pub struct Encoded {
     pub bytes: Vec<u8>,
 }
 
-/// Compress `raw` with `codec` if that makes it smaller; otherwise send it raw.
+/// Compress `raw` as `policy` says for `hint` and the `available` codecs, if
+/// that makes it smaller; otherwise send it raw.
 ///
-/// "Raw" is `Codec::None`, and it is what comes back for a small payload, an
-/// oversized one, or one the codec would have grown -- never a larger frame.
-pub fn encode(codec: Codec, raw: Vec<u8>) -> Result<Encoded, CompressionError> {
-    let worth_trying = codec != Codec::None
-        && raw.len() >= MIN_COMPRESSIBLE_LEN
-        && raw.len() <= MAX_DECOMPRESSED_LEN;
-    if !worth_trying {
-        return Ok(Encoded {
-            codec: Codec::None,
-            bytes: raw,
-        });
+/// "Raw" is `Codec::Identity`, and it is what comes back for no hint, an
+/// oversized payload, a frame below every eligible codec's floor, or one the
+/// chosen codec would not shrink -- never a larger frame.
+pub fn encode(
+    hint: Option<CompressionHint>,
+    available: CodecSet,
+    raw: Vec<u8>,
+) -> Result<Encoded, CompressionError> {
+    if raw.len() > MAX_DECOMPRESSED_LEN {
+        return Ok(identity(raw));
     }
-    let compressed = compress(codec, &raw)?;
+    encode_with(policy(hint, raw.len(), available), raw)
+}
+
+/// `encode` with the choice already made.
+pub fn encode_with(choice: CodecChoice, raw: Vec<u8>) -> Result<Encoded, CompressionError> {
+    if choice.codec == Codec::Identity || raw.len() > MAX_DECOMPRESSED_LEN {
+        return Ok(identity(raw));
+    }
+    let implementation = choice
+        .codec
+        .implementation()
+        .ok_or(CompressionError::NotCompiled(choice.codec))?;
+    let compressed = implementation.compress(&raw, &choice.params)?;
     if compressed.len() >= raw.len() {
-        return Ok(Encoded {
-            codec: Codec::None,
-            bytes: raw,
-        });
+        return Ok(identity(raw));
     }
     Ok(Encoded {
-        codec,
+        codec: choice.codec,
         bytes: compressed,
     })
+}
+
+fn identity(raw: Vec<u8>) -> Encoded {
+    Encoded {
+        codec: Codec::Identity,
+        bytes: raw,
+    }
 }
 
 /// Undo `encode`. Compressed input is refused past `MAX_DECOMPRESSED_LEN`.
 pub fn decode(codec: Codec, bytes: Vec<u8>) -> Result<Vec<u8>, CompressionError> {
     match codec {
-        Codec::None => Ok(bytes),
-        #[cfg(feature = "compression-brotli")]
-        Codec::Brotli => brotli_codec::decompress(&bytes, MAX_DECOMPRESSED_LEN),
-        #[cfg(feature = "compression-deflate")]
-        Codec::Deflate => deflate_codec::decompress(&bytes, MAX_DECOMPRESSED_LEN),
-        #[allow(unreachable_patterns)]
-        other => Err(CompressionError::NotCompiled(other)),
-    }
-}
-
-fn compress(codec: Codec, raw: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    match codec {
-        #[cfg(feature = "compression-brotli")]
-        Codec::Brotli => brotli_codec::compress(raw),
-        #[cfg(feature = "compression-deflate")]
-        Codec::Deflate => deflate_codec::compress(raw),
-        #[allow(unreachable_patterns)]
-        other => {
-            let _ = raw;
-            Err(CompressionError::NotCompiled(other))
-        }
+        Codec::Identity => Ok(bytes),
+        other => other
+            .implementation()
+            .ok_or(CompressionError::NotCompiled(other))?
+            .decompress(&bytes, MAX_DECOMPRESSED_LEN),
     }
 }
 

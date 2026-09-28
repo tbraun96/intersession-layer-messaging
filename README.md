@@ -105,11 +105,30 @@ frames carry none is a legacy peer, and every frame to it is the legacy frame.
 Compression also needs a per-message `CompressionHint`
 (`send_to_with_hint`); no hint means no compression.
 
-Codecs are cargo features, off by default: `compression-brotli` (quality 4,
-window 2^18) and `compression-deflate` (raw deflate, level 1, miniz_oxide).
-Both are pure Rust and build for `wasm32-unknown-unknown`. Frames under 128
-bytes, and frames a codec would not shrink, are sent uncompressed; a receiver
-refuses anything that expands past 16 MiB.
+Every codec sits behind one pure trait (`FrameCodec`: `compress(&[u8],
+&Params)` / `decompress(&[u8], cap)`), registered under a permanent wire id:
+
+| id | codec    | feature                                   |
+|----|----------|-------------------------------------------|
+| 0  | identity | always                                    |
+| 1  | brotli   | `compression-brotli`                      |
+| 2  | deflate  | `compression-deflate` (raw deflate)       |
+| 3  | rill     | reserved (small-frame dictionary codec)   |
+| 4  | zstd     | reserved (pure-Rust no_std zstd)          |
+
+Features are off by default; both implemented codecs are pure Rust and build
+for `wasm32-unknown-unknown`. Peers advertise the whole SET of codec ids they
+decode, so a peer with some codecs and not others is served what it has.
+
+Which codec a frame gets is one table, `compression::policy(hint, len,
+available)`: small (< 1 KiB) structured frames prefer rill, then brotli q4,
+then deflate l1; large JSON, text and Yjs prefer brotli q4, then zstd, then
+deflate; CBOR commands wait for rill; `Opaque` and no hint are identity. A
+codec is skipped if it is not available (compiled, enabled and advertised by
+the peer) or the frame is below its floor (128 B for brotli/deflate), and a
+frame the chosen codec would not shrink is sent raw. A receiver refuses
+anything that expands past 16 MiB. Adding rill or zstd is a registry entry and
+a feature, not a wire change.
 
 The transport encodes what ILM decides: `send_message` takes an
 `OutboundFrame` (payload plus `FrameExtensions`) and `next_message` yields an

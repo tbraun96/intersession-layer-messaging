@@ -28,8 +28,10 @@ pub mod options;
 mod wire_path;
 
 pub use capabilities::PeerCapabilities;
-pub use compression::{Codec, CompressionError, CompressionHint, DynamicCompression};
-pub use frame::{CapabilityEvidence, FrameExtensions, InboundFrame, OutboundFrame};
+pub use compression::{Codec, CodecSet, CompressionError, CompressionHint, DynamicCompression};
+pub use frame::{
+    CapabilityEvidence, CompressionPlan, FrameExtensions, InboundFrame, OutboundFrame,
+};
 pub use negotiation::{PIGGYBACK_ACK_EVERY, PIGGYBACK_ACK_WINDOW};
 pub use options::IlmOptions;
 #[cfg(feature = "testing")]

@@ -1,5 +1,10 @@
 use super::*;
 
+mod policy_table;
+
+#[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
+mod compiled;
+
 pub(super) fn json_like(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     let mut n: u32 = 0;
@@ -12,54 +17,6 @@ pub(super) fn json_like(len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
-}
-
-/// Deterministic noise with no structure a codec can use.
-#[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
-pub(super) fn incompressible(len: usize) -> Vec<u8> {
-    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 24) as u8
-        })
-        .collect()
-}
-
-pub(super) fn all_caps() -> PeerCapabilities {
-    PeerCapabilities::from_wire(0xff)
-}
-
-#[test]
-fn no_hint_and_non_compressing_hints_choose_no_codec() {
-    for hint in [
-        None,
-        Some(CompressionHint::Opaque),
-        Some(CompressionHint::CborCommand),
-    ] {
-        assert_eq!(Codec::for_hint(hint, all_caps()), Codec::None, "{hint:?}");
-    }
-}
-
-#[test]
-fn compressing_hints_prefer_brotli_then_deflate_then_nothing() {
-    let brotli_only = PeerCapabilities::from_wire(PeerCapabilities::CODEC_BROTLI);
-    let deflate_only = PeerCapabilities::from_wire(PeerCapabilities::CODEC_DEFLATE);
-    for hint in [
-        CompressionHint::Text,
-        CompressionHint::Json,
-        CompressionHint::YjsUpdate,
-    ] {
-        assert_eq!(Codec::for_hint(Some(hint), all_caps()), Codec::Brotli);
-        assert_eq!(Codec::for_hint(Some(hint), brotli_only), Codec::Brotli);
-        assert_eq!(Codec::for_hint(Some(hint), deflate_only), Codec::Deflate);
-        assert_eq!(
-            Codec::for_hint(Some(hint), PeerCapabilities::LEGACY),
-            Codec::None
-        );
-    }
 }
 
 #[test]
@@ -80,29 +37,53 @@ fn hint_names_round_trip_and_unknown_names_are_refused() {
 }
 
 #[test]
-fn unknown_codec_ids_are_refused() {
-    assert_eq!(Codec::from_wire(3), Err(CompressionError::UnknownCodec(3)));
-    for codec in [Codec::None, Codec::Brotli, Codec::Deflate] {
+fn codec_ids_are_stable_and_unknown_ids_are_refused() {
+    // Permanent: a frame written by one build is read by every later one.
+    let ids: Vec<(Codec, u8)> = Codec::ALL.iter().map(|c| (*c, c.to_wire())).collect();
+    assert_eq!(
+        ids,
+        vec![
+            (Codec::Identity, 0),
+            (Codec::Brotli, 1),
+            (Codec::Deflate, 2),
+            (Codec::Rill, 3),
+            (Codec::Zstd, 4),
+        ]
+    );
+    for codec in Codec::ALL {
         assert_eq!(Codec::from_wire(codec.to_wire()), Ok(codec));
     }
+    assert_eq!(Codec::from_wire(5), Err(CompressionError::UnknownCodec(5)));
 }
 
 #[test]
-fn codec_none_passes_bytes_through_untouched() {
+fn identity_passes_bytes_through_untouched() {
     let raw = json_like(4096);
-    let encoded = encode(Codec::None, raw.clone()).expect("encode");
+    let encoded = encode(None, CodecSet::compiled(), raw.clone()).expect("encode");
     assert_eq!(
         encoded,
         Encoded {
-            codec: Codec::None,
+            codec: Codec::Identity,
             bytes: raw.clone()
         }
     );
-    assert_eq!(decode(Codec::None, raw.clone()).expect("decode"), raw);
+    assert_eq!(decode(Codec::Identity, raw.clone()).expect("decode"), raw);
 }
 
-#[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
-mod compiled;
+#[test]
+fn reserved_codecs_are_refused_rather_than_misread() {
+    for codec in [Codec::Rill, Codec::Zstd] {
+        assert!(
+            codec.implementation().is_none(),
+            "{codec:?} is only reserved"
+        );
+        assert!(!CodecSet::compiled().contains(codec));
+        assert_eq!(
+            decode(codec, vec![1, 2, 3]),
+            Err(CompressionError::NotCompiled(codec))
+        );
+    }
+}
 
 #[cfg(not(feature = "compression-brotli"))]
 #[test]
@@ -111,10 +92,7 @@ fn a_build_without_brotli_refuses_brotli_rather_than_misreading_it() {
         decode(Codec::Brotli, vec![1, 2, 3]),
         Err(CompressionError::NotCompiled(Codec::Brotli))
     );
-    assert_eq!(
-        encode(Codec::Brotli, json_like(1024)),
-        Err(CompressionError::NotCompiled(Codec::Brotli))
-    );
+    assert!(!CodecSet::compiled().contains(Codec::Brotli));
 }
 
 #[cfg(not(feature = "compression-deflate"))]
@@ -124,4 +102,5 @@ fn a_build_without_deflate_refuses_deflate_rather_than_misreading_it() {
         decode(Codec::Deflate, vec![1, 2, 3]),
         Err(CompressionError::NotCompiled(Codec::Deflate))
     );
+    assert!(!CodecSet::compiled().contains(Codec::Deflate));
 }

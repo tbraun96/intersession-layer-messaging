@@ -12,6 +12,34 @@ fn compiled_codecs() -> Vec<Codec> {
     .to_vec()
 }
 
+/// Deterministic noise with no structure a codec can use.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// The choice `policy` makes for a large JSON frame when only `codec` is available.
+fn choice_for(codec: Codec) -> CodecChoice {
+    let choice = policy(Some(CompressionHint::Json), 20_000, CodecSet::of(&[codec]));
+    assert_eq!(choice.codec, codec);
+    choice
+}
+
+fn compress_raw(codec: Codec, raw: &[u8]) -> Vec<u8> {
+    codec
+        .implementation()
+        .expect("compiled")
+        .compress(raw, &choice_for(codec).params)
+        .expect("compress")
+}
+
 #[test]
 fn every_compressing_hint_round_trips_smaller() {
     for codec in compiled_codecs() {
@@ -21,15 +49,7 @@ fn every_compressing_hint_round_trips_smaller() {
             CompressionHint::YjsUpdate,
         ] {
             let raw = json_like(2048);
-            let chosen = Codec::for_hint(
-                Some(hint),
-                PeerCapabilities::from_wire(match codec {
-                    Codec::Brotli => PeerCapabilities::CODEC_BROTLI,
-                    _ => PeerCapabilities::CODEC_DEFLATE,
-                }),
-            );
-            assert_eq!(chosen, codec);
-            let encoded = encode(chosen, raw.clone()).expect("encode");
+            let encoded = encode(Some(hint), CodecSet::of(&[codec]), raw.clone()).expect("encode");
             assert_eq!(encoded.codec, codec, "{hint:?} should have compressed");
             assert!(
                 encoded.bytes.len() < raw.len() / 2,
@@ -43,29 +63,14 @@ fn every_compressing_hint_round_trips_smaller() {
 }
 
 #[test]
-fn a_frame_below_the_threshold_is_sent_raw() {
-    for codec in compiled_codecs() {
-        let raw = json_like(MIN_COMPRESSIBLE_LEN - 1);
-        let encoded = encode(codec, raw.clone()).expect("encode");
-        assert_eq!(
-            encoded,
-            Encoded {
-                codec: Codec::None,
-                bytes: raw
-            }
-        );
-    }
-}
-
-#[test]
 fn a_frame_the_codec_would_grow_is_sent_raw() {
     for codec in compiled_codecs() {
-        let raw = incompressible(1024);
-        let encoded = encode(codec, raw.clone()).expect("encode");
+        let raw = incompressible(4096);
+        let encoded = encode_with(choice_for(codec), raw.clone()).expect("encode");
         assert_eq!(
             encoded,
             Encoded {
-                codec: Codec::None,
+                codec: Codec::Identity,
                 bytes: raw
             },
             "{codec:?}"
@@ -77,8 +82,9 @@ fn a_frame_the_codec_would_grow_is_sent_raw() {
 fn a_frame_past_the_ceiling_is_sent_raw_so_the_receiver_never_refuses_it() {
     for codec in compiled_codecs() {
         let raw = vec![0u8; MAX_DECOMPRESSED_LEN + 1];
-        let encoded = encode(codec, raw).expect("encode");
-        assert_eq!(encoded.codec, Codec::None);
+        let encoded =
+            encode(Some(CompressionHint::Json), CodecSet::of(&[codec]), raw).expect("encode");
+        assert_eq!(encoded.codec, Codec::Identity);
     }
 }
 
@@ -86,7 +92,7 @@ fn a_frame_past_the_ceiling_is_sent_raw_so_the_receiver_never_refuses_it() {
 fn a_decompression_bomb_is_refused_at_the_ceiling() {
     for codec in compiled_codecs() {
         // Built with the codec directly: `encode` would refuse to make it.
-        let bomb = compress(codec, &vec![0u8; MAX_DECOMPRESSED_LEN + 1]).expect("compress");
+        let bomb = compress_raw(codec, &vec![0u8; MAX_DECOMPRESSED_LEN + 1]);
         // A real bomb: a tiny fraction of what it claims.
         assert!(
             bomb.len() < MAX_DECOMPRESSED_LEN / 100,
@@ -101,7 +107,7 @@ fn a_decompression_bomb_is_refused_at_the_ceiling() {
             "{codec:?}"
         );
         // Exactly at the ceiling is still accepted.
-        let edge = compress(codec, &vec![0u8; MAX_DECOMPRESSED_LEN]).expect("compress");
+        let edge = compress_raw(codec, &vec![0u8; MAX_DECOMPRESSED_LEN]);
         assert_eq!(
             decode(codec, edge).expect("at the limit").len(),
             MAX_DECOMPRESSED_LEN
@@ -112,7 +118,8 @@ fn a_decompression_bomb_is_refused_at_the_ceiling() {
 #[test]
 fn malformed_input_is_an_error_not_a_panic() {
     for codec in compiled_codecs() {
-        let good = compress(codec, &json_like(4096)).expect("compress");
+        let original = json_like(4096);
+        let good = compress_raw(codec, &original);
         let truncated = good[..good.len() / 2].to_vec();
         let mut flipped = good.clone();
         for byte in flipped.iter_mut().step_by(3) {
@@ -126,19 +133,18 @@ fn malformed_input_is_an_error_not_a_panic() {
         ] {
             let result = std::panic::catch_unwind(|| decode(codec, bytes));
             let result = result.unwrap_or_else(|_| panic!("{codec:?} panicked on {name} input"));
-            // Deflate cannot always tell truncation from a short stream, and
-            // an empty raw-deflate stream is not an error in every decoder.
-            // What must never happen is a panic or the ORIGINAL coming back.
+            // Raw deflate has no checksum, so a damaged stream can decode to
+            // other bytes; the SDK's AEAD below this layer is what rules
+            // corruption out in transit. What must never happen is a panic or
+            // the ORIGINAL coming back.
             if let Ok(decoded) = result {
                 assert_ne!(
-                    decoded,
-                    json_like(4096),
+                    decoded, original,
                     "{codec:?} {name} decoded to the original"
                 );
             }
         }
-        // Noise, specifically, has to be refused by brotli: its stream
-        // header is strict enough that random bytes do not parse.
+        // Brotli's stream header is strict enough that noise must not parse.
         if codec == Codec::Brotli {
             assert!(matches!(
                 decode(codec, incompressible(512)),

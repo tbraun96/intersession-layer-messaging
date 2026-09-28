@@ -7,62 +7,77 @@
 //! extension a peer has not proven it can read is how a compressed frame ends
 //! up rendered as a chat message on an old client, so the rule is absolute.
 
-use crate::compression::{Codec, DynamicCompression};
+use crate::compression::{Codec, CodecSet};
 use crate::options::IlmOptions;
 
-/// A set of wire extensions, as one byte on the wire.
+/// Protocol features plus the SET of codecs a peer can decode.
 ///
-/// Unknown bits are dropped on decode rather than kept: a bit this build does
-/// not know is a feature it cannot use, and keeping it would let a later
-/// `contains` answer for something nobody implemented here.
+/// The codec set is advertised as a whole, so a peer with rill but not zstd,
+/// or deflate but not brotli, is served exactly what it has.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PeerCapabilities {
-    bits: u8,
+    flags: u8,
+    codecs: CodecSet,
 }
 
 impl PeerCapabilities {
     /// The receiver folds a piggybacked cumulative ACK out of a data frame.
     pub const PIGGYBACK_ACKS: u8 = 0b0000_0001;
-    /// The receiver can decode brotli-compressed contents.
-    pub const CODEC_BROTLI: u8 = 0b0000_0010;
-    /// The receiver can decode raw-deflate-compressed contents.
-    pub const CODEC_DEFLATE: u8 = 0b0000_0100;
 
-    const KNOWN: u8 = Self::PIGGYBACK_ACKS | Self::CODEC_BROTLI | Self::CODEC_DEFLATE;
+    const KNOWN_FLAGS: u8 = Self::PIGGYBACK_ACKS;
 
     /// Nothing beyond the legacy frames: what every peer is until it says otherwise.
-    pub const LEGACY: Self = Self { bits: 0 };
+    pub const LEGACY: Self = Self {
+        flags: 0,
+        codecs: CodecSet::EMPTY,
+    };
 
-    pub const fn from_wire(byte: u8) -> Self {
+    pub const fn new(piggyback_acks: bool, codecs: CodecSet) -> Self {
         Self {
-            bits: byte & Self::KNOWN,
+            flags: if piggyback_acks {
+                Self::PIGGYBACK_ACKS
+            } else {
+                0
+            },
+            codecs,
         }
     }
 
-    pub const fn to_wire(self) -> u8 {
-        self.bits
+    /// Unknown flags and codec ids are dropped: a feature this build cannot
+    /// name is one it cannot use, and keeping it would let a later check
+    /// answer for something nobody implemented here.
+    pub const fn from_wire(flags: u8, codecs: u32) -> Self {
+        Self {
+            flags: flags & Self::KNOWN_FLAGS,
+            codecs: CodecSet::from_wire(codecs),
+        }
+    }
+
+    pub const fn flags_to_wire(self) -> u8 {
+        self.flags
+    }
+
+    pub const fn codecs(self) -> CodecSet {
+        self.codecs
     }
 
     pub const fn is_legacy(self) -> bool {
-        self.bits == 0
+        self.flags == 0 && self.codecs.is_empty()
     }
 
     pub const fn piggybacks_acks(self) -> bool {
-        self.bits & Self::PIGGYBACK_ACKS != 0
+        self.flags & Self::PIGGYBACK_ACKS != 0
     }
 
     pub const fn decodes(self, codec: Codec) -> bool {
-        match codec {
-            Codec::None => true,
-            Codec::Brotli => self.bits & Self::CODEC_BROTLI != 0,
-            Codec::Deflate => self.bits & Self::CODEC_DEFLATE != 0,
-        }
+        self.codecs.contains(codec)
     }
 
     /// What both ends support: the only set either may use toward the other.
     pub const fn intersect(self, other: Self) -> Self {
         Self {
-            bits: self.bits & other.bits,
+            flags: self.flags & other.flags,
+            codecs: self.codecs.intersect(other.codecs),
         }
     }
 
@@ -72,48 +87,29 @@ impl PeerCapabilities {
     /// whose compression is `Disabled` asks peers not to compress toward it,
     /// which keeps "off" meaning off in both directions.
     pub fn local(options: &IlmOptions) -> Self {
-        let mut bits = 0;
-        if options.piggyback_acks {
-            bits |= Self::PIGGYBACK_ACKS;
-        }
-        for codec in options.dynamic_compression.codecs() {
-            bits |= match codec {
-                Codec::None => 0,
-                Codec::Brotli => Self::CODEC_BROTLI,
-                Codec::Deflate => Self::CODEC_DEFLATE,
-            };
-        }
-        Self { bits }
-    }
-}
-
-impl DynamicCompression {
-    /// The codecs this setting permits, strongest first.
-    pub fn codecs(self) -> &'static [Codec] {
-        match self {
-            DynamicCompression::Disabled => &[],
-            #[cfg(feature = "compression-brotli")]
-            DynamicCompression::Brotli => &[Codec::Brotli],
-            #[cfg(feature = "compression-deflate")]
-            DynamicCompression::Deflate => &[Codec::Deflate],
-            #[cfg(all(feature = "compression-brotli", feature = "compression-deflate"))]
-            DynamicCompression::All => &[Codec::Brotli, Codec::Deflate],
-            #[cfg(all(feature = "compression-brotli", not(feature = "compression-deflate")))]
-            DynamicCompression::All => &[Codec::Brotli],
-            #[cfg(all(feature = "compression-deflate", not(feature = "compression-brotli")))]
-            DynamicCompression::All => &[Codec::Deflate],
-        }
+        Self::new(
+            options.piggyback_acks,
+            options
+                .dynamic_compression
+                .codecs()
+                .intersect(CodecSet::compiled()),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::DynamicCompression;
 
     #[test]
-    fn unknown_bits_are_not_kept() {
-        let caps = PeerCapabilities::from_wire(0xff);
-        assert_eq!(caps.to_wire(), PeerCapabilities::KNOWN);
+    fn unknown_flags_and_codec_ids_are_not_kept() {
+        let caps = PeerCapabilities::from_wire(0xff, u32::MAX);
+        assert_eq!(caps.flags_to_wire(), PeerCapabilities::KNOWN_FLAGS);
+        for codec in Codec::ALL {
+            assert!(caps.decodes(codec), "{codec:?} is known and must survive");
+        }
+        assert_eq!(caps.codecs().to_wire() >> (Codec::ALL.len() as u32), 0);
     }
 
     #[test]
@@ -126,10 +122,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_decodes_only_uncompressed() {
-        assert!(PeerCapabilities::LEGACY.decodes(Codec::None));
-        assert!(!PeerCapabilities::LEGACY.decodes(Codec::Brotli));
-        assert!(!PeerCapabilities::LEGACY.decodes(Codec::Deflate));
+    fn legacy_decodes_only_identity() {
+        for codec in Codec::ALL {
+            assert_eq!(
+                PeerCapabilities::LEGACY.decodes(codec),
+                codec == Codec::Identity
+            );
+        }
         assert!(!PeerCapabilities::LEGACY.piggybacks_acks());
+    }
+
+    #[test]
+    fn a_partial_codec_set_intersects_to_what_both_have() {
+        let rill_and_deflate =
+            PeerCapabilities::new(true, CodecSet::of(&[Codec::Rill, Codec::Deflate]));
+        let brotli_and_deflate =
+            PeerCapabilities::new(false, CodecSet::of(&[Codec::Brotli, Codec::Deflate]));
+        let shared = rill_and_deflate.intersect(brotli_and_deflate);
+        assert!(shared.decodes(Codec::Deflate));
+        assert!(!shared.decodes(Codec::Rill));
+        assert!(!shared.decodes(Codec::Brotli));
+        assert!(!shared.piggybacks_acks());
     }
 }
