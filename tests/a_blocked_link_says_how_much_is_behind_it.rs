@@ -13,6 +13,7 @@
 //! stuck link -- the one a reader actually finds -- carried neither number.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::ILM;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,9 +56,14 @@ async fn the_blocked_warning_names_the_queue_depth() {
     let _bob_wire = network.add_peer(BOB).await;
 
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
 
     // Five behind one head. The head goes out and is never acknowledged; the
     // other four cannot follow it, and their number is the thing being pinned.

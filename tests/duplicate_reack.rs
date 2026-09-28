@@ -13,6 +13,8 @@
 //! because sending is all it ever got to do.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
+use intersession_layer_messaging::InboundFrame;
 use intersession_layer_messaging::{
     Backend, MessageMetadata, Payload, UnderlyingSessionTransport, ILM,
 };
@@ -28,7 +30,10 @@ async fn next_ack(alice: &InMemoryNetwork<TestMessage>, within: Duration) -> Opt
         match citadel_io::tokio::time::timeout(Duration::from_millis(250), alice.next_message())
             .await
         {
-            Ok(Some(Payload::Ack { message_id, .. })) => return Some(message_id),
+            Ok(Some(InboundFrame {
+                payload: Payload::Ack { message_id, .. },
+                ..
+            })) => return Some(message_id),
             Ok(Some(_)) => continue,
             Ok(None) => return None,
             Err(_) => continue,
@@ -53,7 +58,7 @@ async fn a_retransmitted_message_is_acknowledged_again() {
     let local = network.add_peer(LOCAL).await;
 
     let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
-    let _ilm = ILM::new(backend.clone(), tx, local)
+    let _ilm = ILM::new(backend.clone(), tx, local, IlmOptions::LEGACY)
         .await
         .expect("construct ILM");
 

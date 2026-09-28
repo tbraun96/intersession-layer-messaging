@@ -1,5 +1,6 @@
 use crate::{
-    Backend, BackendError, MessageMetadata, NetworkError, Payload, UnderlyingSessionTransport,
+    Backend, BackendError, InboundFrame, MessageMetadata, NetworkError, OutboundFrame, Payload,
+    UnderlyingSessionTransport,
 };
 use async_trait::async_trait;
 use citadel_io::tokio::sync::{Mutex, RwLock};
@@ -225,7 +226,7 @@ impl<M: MessageMetadata + Clone + Send + Sync + 'static> Backend<M> for InMemory
 
 pub struct InMemoryNetwork<M: MessageMetadata> {
     messages: InMemoryMessageQueue<M::PeerId, M>,
-    my_rx: Arc<Mutex<citadel_io::tokio::sync::mpsc::UnboundedReceiver<Payload<M>>>>,
+    my_rx: Arc<Mutex<citadel_io::tokio::sync::mpsc::UnboundedReceiver<InboundFrame<M>>>>,
     my_id: M::PeerId,
     /// How many times `next_message` has resolved to None, i.e. been polled on a
     /// closed transport. A caller that treats close as terminal reads 1; one that
@@ -234,7 +235,7 @@ pub struct InMemoryNetwork<M: MessageMetadata> {
 }
 
 pub type InMemoryMessageQueue<PeerId, M> =
-    Arc<RwLock<HashMap<PeerId, citadel_io::tokio::sync::mpsc::UnboundedSender<Payload<M>>>>>;
+    Arc<RwLock<HashMap<PeerId, citadel_io::tokio::sync::mpsc::UnboundedSender<InboundFrame<M>>>>>;
 
 impl<M: MessageMetadata> Clone for InMemoryNetwork<M> {
     fn clone(&self) -> Self {
@@ -291,16 +292,26 @@ impl<M: MessageMetadata> InMemoryNetwork<M> {
         self.closed_polls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Deliver `message` to `id` exactly as a legacy peer would frame it.
     pub async fn send_to_peer(
         &self,
         id: M::PeerId,
         message: Payload<M>,
-    ) -> Result<(), NetworkError<Payload<M>>> {
+    ) -> Result<(), NetworkError<OutboundFrame<M>>> {
+        self.deliver_frame(id, OutboundFrame::legacy(message)).await
+    }
+
+    async fn deliver_frame(
+        &self,
+        id: M::PeerId,
+        frame: OutboundFrame<M>,
+    ) -> Result<(), NetworkError<OutboundFrame<M>>> {
         if let Some(tx) = self.messages.read().await.get(&id) {
-            tx.send(message).map_err(|err| NetworkError::SendFailed {
-                reason: err.to_string(),
-                message: err.0,
-            })
+            tx.send(InboundFrame::delivered(frame))
+                .map_err(|err| NetworkError::SendFailed {
+                    reason: err.to_string(),
+                    message: OutboundFrame::legacy(err.0.payload),
+                })
         } else {
             Err(NetworkError::ConnectionError("Peer not found".into()))
         }
@@ -311,7 +322,7 @@ impl<M: MessageMetadata> InMemoryNetwork<M> {
 impl<M: MessageMetadata> UnderlyingSessionTransport for InMemoryNetwork<M> {
     type Message = M;
 
-    async fn next_message(&self) -> Option<Payload<Self::Message>> {
+    async fn next_message(&self) -> Option<InboundFrame<Self::Message>> {
         let next = self.my_rx.lock().await.recv().await;
         if next.is_none() {
             self.closed_polls
@@ -322,16 +333,10 @@ impl<M: MessageMetadata> UnderlyingSessionTransport for InMemoryNetwork<M> {
 
     async fn send_message(
         &self,
-        message: Payload<Self::Message>,
-    ) -> Result<(), NetworkError<Payload<M>>> {
-        match &message {
-            Payload::Message(msg) => {
-                let peer_id = msg.destination_id();
-                self.send_to_peer(peer_id, message).await
-            }
-            Payload::Ack { to_id, .. } => self.send_to_peer(*to_id, message).await,
-            Payload::Poll { to_id, .. } => self.send_to_peer(*to_id, message).await,
-        }
+        frame: OutboundFrame<Self::Message>,
+    ) -> Result<(), NetworkError<OutboundFrame<M>>> {
+        let peer_id = frame.payload.destination_id();
+        self.deliver_frame(peer_id, frame).await
     }
 
     async fn connected_peers(&self) -> Vec<<Self::Message as MessageMetadata>::PeerId> {
@@ -424,7 +429,7 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
 #[cfg(test)]
 mod tests {
     use crate::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
-    use crate::{Backend, BackendError, MessageMetadata, NetworkError, Payload, ILM};
+    use crate::{Backend, BackendError, IlmOptions, MessageMetadata, NetworkError, Payload, ILM};
     use async_trait::async_trait;
     use citadel_io::tokio::time::sleep;
     use citadel_logging::setup_log;
@@ -447,8 +452,12 @@ mod tests {
         let (tx1, mut rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let messenger1 = ILM::new(backend1, tx1, network1).await.unwrap();
-        let messenger2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let messenger1 = ILM::new(backend1, tx1, network1, IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let messenger2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         // Peer 1 sends a message to Peer 2
         messenger1.send_to(2, vec![1, 2, 3]).await.unwrap();
@@ -479,7 +488,9 @@ mod tests {
             let network = network.add_peer(this_peer_id).await;
             let backend = InMemoryBackend::<TestMessage>::default();
             let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
-            let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
+            let message_system = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
+                .await
+                .unwrap();
 
             let future = async move {
                 let message_contents = vec![1, 2, 3];
@@ -531,7 +542,9 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -550,7 +563,9 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         let message = TestMessage {
             source_id: 2, // Mismatched source ID
@@ -569,7 +584,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -612,8 +627,12 @@ mod tests {
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         let messages = vec![
             TestMessage {
@@ -655,7 +674,9 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         message_system
             .is_running
@@ -681,8 +702,12 @@ mod tests {
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend, tx, network.clone()).await.unwrap();
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let message_system = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         const NUM_MESSAGES: u8 = 255;
         let mut messages = vec![];
@@ -719,7 +744,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -751,10 +776,12 @@ mod tests {
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         // Send the same message twice
         let message = TestMessage {
@@ -792,7 +819,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -825,7 +852,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -865,8 +892,12 @@ mod tests {
         let (tx1, mut rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
-        let message_system2 = ILM::new(backend2, tx2, network2.clone()).await.unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let message_system2 = ILM::new(backend2, tx2, network2.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         // Peer 1 sends to Peer 2
         let message1 = TestMessage {
@@ -924,8 +955,12 @@ mod tests {
         let (tx1, mut rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
-        let message_system2 = ILM::new(backend2, tx2, network2.clone()).await.unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let message_system2 = ILM::new(backend2, tx2, network2.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         const NUM_MESSAGES: u8 = 255;
 
@@ -1031,7 +1066,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1065,8 +1100,12 @@ mod tests {
         let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -1090,7 +1129,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1129,8 +1168,12 @@ mod tests {
         let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1, tx1, network.clone()).await.unwrap();
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let message_system1 = ILM::new(backend1, tx1, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -1233,7 +1276,9 @@ mod tests {
         let network = InMemoryNetwork::<TestMessage>::new().add_peer(1).await;
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(FailingBackend, tx, network.clone()).await.unwrap();
+        let message_system = ILM::new(FailingBackend, tx, network.clone(), IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         let message = TestMessage {
             source_id: 1,
@@ -1258,7 +1303,7 @@ mod tests {
         let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1279,7 +1324,9 @@ mod tests {
 
         // Now create peer 2's message system - this should trigger the peer polling mechanism
         let network2 = network.add_peer(2).await;
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         // Should receive all messages in order due to polling
         for i in 0..3 {
@@ -1303,10 +1350,12 @@ mod tests {
         let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
-        let _message_system2 = ILM::new(backend2, tx2, network2).await.unwrap();
+        let _message_system2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY)
+            .await
+            .unwrap();
 
         // Send some messages
         for i in 0..3 {
@@ -1343,7 +1392,7 @@ mod tests {
         let backend = InMemoryBackend::<TestMessage>::default();
         let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-        let message_system = ILM::new(backend.clone(), tx, network.clone())
+        let message_system = ILM::new(backend.clone(), tx, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1376,12 +1425,14 @@ mod tests {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             // Send messages with IDs 0,1,2
             for i in 0..3 {
@@ -1406,12 +1457,14 @@ mod tests {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             // Send new message - should use ID 3
             let message = TestMessage {
@@ -1440,12 +1493,14 @@ mod tests {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let (tx2, _rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             let message = TestMessage {
                 source_id: 1,
@@ -1461,12 +1516,14 @@ mod tests {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let (tx2, _rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-            let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let _message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             // Check pending messages
             let pending = backend1.get_pending_outbound().await.unwrap();
@@ -1488,12 +1545,14 @@ mod tests {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let (tx2, _rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             // Send multiple messages
             for i in 0..5 {
@@ -1511,12 +1570,14 @@ mod tests {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = citadel_io::tokio::sync::mpsc::unbounded_channel();
 
-            let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let _message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             log::warn!(target: "ism", "Message system 1 backend outbound: {:?}", backend1.get_pending_outbound().await.unwrap());
             log::warn!(target: "ism", "Message system 2 backend outbound: {:?}", backend2.get_pending_outbound().await.unwrap());
@@ -1551,9 +1612,10 @@ mod tests {
         // First session - send messages to multiple peers
         {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
-            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
+            let message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             // Send messages to both peer 2 and 3
             for peer_id in [2, 3] {
@@ -1570,9 +1632,10 @@ mod tests {
         // Second session - verify state for both peers
         {
             let (tx1, _rx1) = citadel_io::tokio::sync::mpsc::unbounded_channel();
-            let _message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
+            let _message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             let pending = backend1.get_pending_outbound().await.unwrap();
             let pending_peers: HashSet<_> =
@@ -1605,7 +1668,7 @@ mod tests {
         let backend1 = InMemoryBackend::<TestMessage>::default();
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1666,7 +1729,7 @@ mod tests {
         let backend2 = InMemoryBackend::<TestMessage>::default();
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1684,9 +1747,10 @@ mod tests {
 
         // Now peer 2's ILM comes online - message is already queued in network
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-            .await
-            .unwrap();
+        let _message_system2 =
+            ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                .await
+                .unwrap();
 
         // Wait for message delivery
         match tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
@@ -1740,10 +1804,10 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
-        let message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
+        let message_system2 = ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1802,9 +1866,10 @@ mod tests {
         // Step 4: Bob reconnects (new network entry, new ILM, same backend)
         let network2_new = network.add_peer(2).await;
         let (tx2_new, mut rx2_new) = tokio::sync::mpsc::unbounded_channel();
-        let _message_system2_new = ILM::new(backend2.clone(), tx2_new, network2_new)
-            .await
-            .unwrap();
+        let _message_system2_new =
+            ILM::new(backend2.clone(), tx2_new, network2_new, IlmOptions::LEGACY)
+                .await
+                .unwrap();
 
         // Step 5: Verify the 3 queued messages are delivered
         for i in 1..=3 {
@@ -1845,7 +1910,7 @@ mod tests {
         let backend2 = InMemoryBackend::<TestMessage>::default();
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
 
-        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone())
+        let message_system1 = ILM::new(backend1.clone(), tx1, network1.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -1875,9 +1940,10 @@ mod tests {
 
         // Now peer 2's ILM comes online - but the message was already lost!
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-            .await
-            .unwrap();
+        let _message_system2 =
+            ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                .await
+                .unwrap();
 
         // With the resync mechanism:
         // 1. Peer 2 sends a Poll to peer 1 with last_received_from_peer=None
@@ -1966,10 +2032,10 @@ mod tests {
         let (tx1, mut _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone())
+        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
-        let _ilm2 = ILM::new(backend2.clone(), tx2, network2.clone())
+        let _ilm2 = ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -2094,10 +2160,10 @@ mod tests {
         let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone())
+        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
-        let ilm2 = ILM::new(backend2.clone(), tx2, network2.clone())
+        let ilm2 = ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
 
@@ -2239,12 +2305,14 @@ mod tests {
             let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
             let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-            let message_system1 = ILM::new(backend1.clone(), tx1, network.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2.clone())
-                .await
-                .unwrap();
+            let message_system1 =
+                ILM::new(backend1.clone(), tx1, network.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
+            let _message_system2 =
+                ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
+                    .await
+                    .unwrap();
 
             // Send a message from peer 1 to peer 2
             let msg = TestMessage {
@@ -2302,12 +2370,22 @@ mod tests {
             let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
             // This should trigger the fix: clear last_sent[2] since last_acked[2] is None
-            let message_system1 = ILM::new(backend1.clone(), tx1, network_new.clone())
-                .await
-                .unwrap();
-            let _message_system2 = ILM::new(backend2.clone(), tx2, network2_new.clone())
-                .await
-                .unwrap();
+            let message_system1 = ILM::new(
+                backend1.clone(),
+                tx1,
+                network_new.clone(),
+                IlmOptions::LEGACY,
+            )
+            .await
+            .unwrap();
+            let _message_system2 = ILM::new(
+                backend2.clone(),
+                tx2,
+                network2_new.clone(),
+                IlmOptions::LEGACY,
+            )
+            .await
+            .unwrap();
 
             // Now send a new message - without the fix, this would be blocked forever
             //
@@ -2361,10 +2439,10 @@ mod tests {
         let (tx1, mut _rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone())
+        let ilm1 = ILM::new(backend1.clone(), tx1, network1.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
-        let _ilm2 = ILM::new(backend2.clone(), tx2, network2.clone())
+        let _ilm2 = ILM::new(backend2.clone(), tx2, network2.clone(), IlmOptions::LEGACY)
             .await
             .unwrap();
         let mut stranded = Vec::new();

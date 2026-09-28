@@ -45,7 +45,7 @@ Below is an example of using the `TestMessage` type, which already implements `M
 ### Basic Example
 
 ```rust
-use intersession_layer_messaging::{ILM, MessageMetadata, Network, Backend, LocalDelivery, testing::*};
+use intersession_layer_messaging::{ILM, IlmOptions, MessageMetadata, Network, Backend, LocalDelivery, testing::*};
 
 #[tokio::main]
 async fn main() {
@@ -59,8 +59,10 @@ async fn main() {
     let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
     let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
 
-    let messenger1 = ILM::new(backend1, tx1, network1).await.unwrap();
-    let messenger2 = ILM::new(backend2, tx2, network2).await.unwrap();
+    // Every construction site says which wire extensions it wants; LEGACY is
+    // the original protocol, byte for byte.
+    let messenger1 = ILM::new(backend1, tx1, network1, IlmOptions::LEGACY).await.unwrap();
+    let messenger2 = ILM::new(backend2, tx2, network2, IlmOptions::LEGACY).await.unwrap();
 
     // Peer 1 sends a message to Peer 2
     messenger1.send_to(2, vec![1, 2, 3]).await.unwrap();
@@ -81,6 +83,56 @@ async fn main() {
     assert_eq!(received_message2.contents(), &[1, 2, 3]);
 }
 ```
+
+### Wire extensions: piggybacked ACKs and compression
+
+`IlmOptions` has no default; each construction site chooses:
+
+```rust
+let options = IlmOptions {
+    // Fold the cumulative ACK into the next data frame to the same peer; a
+    // standalone ACK still goes within PIGGYBACK_ACK_WINDOW (40 ms), and at
+    // once after PIGGYBACK_ACK_EVERY (4) deliveries.
+    piggyback_acks: true,
+    // Disabled, or (with the matching cargo features) Brotli, Deflate, All.
+    dynamic_compression: DynamicCompression::All,
+};
+```
+
+Both are used toward a peer only after that peer has advertised them. Every
+Ack and Poll carries this node's `PeerCapabilities`; a peer whose control
+frames carry none is a legacy peer, and every frame to it is the legacy frame.
+Compression also needs a per-message `CompressionHint`
+(`send_to_with_hint`); no hint means no compression.
+
+Every codec sits behind one pure trait (`FrameCodec`: `compress(&[u8],
+&Params)` / `decompress(&[u8], cap)`), registered under a permanent wire id:
+
+| id | codec    | feature                                   |
+|----|----------|-------------------------------------------|
+| 0  | identity | always                                    |
+| 1  | brotli   | `compression-brotli`                      |
+| 2  | deflate  | `compression-deflate` (raw deflate)       |
+| 3  | rill     | reserved (small-frame dictionary codec)   |
+| 4  | zstd     | reserved (pure-Rust no_std zstd)          |
+
+Features are off by default; both implemented codecs are pure Rust and build
+for `wasm32-unknown-unknown`. Peers advertise the whole SET of codec ids they
+decode, so a peer with some codecs and not others is served what it has.
+
+Which codec a frame gets is one table, `compression::policy(hint, len,
+available)`: small (< 1 KiB) structured frames prefer rill, then brotli q4,
+then deflate l1; large JSON, text and Yjs prefer brotli q4, then zstd, then
+deflate; CBOR commands wait for rill; `Opaque` and no hint are identity. A
+codec is skipped if it is not available (compiled, enabled and advertised by
+the peer) or the frame is below its floor (128 B for brotli/deflate), and a
+frame the chosen codec would not shrink is sent raw. A receiver refuses
+anything that expands past 16 MiB. Adding rill or zstd is a registry entry and
+a feature, not a wire change.
+
+The transport encodes what ILM decides: `send_message` takes an
+`OutboundFrame` (payload plus `FrameExtensions`) and `next_message` yields an
+`InboundFrame` (payload, `CapabilityEvidence`, any piggybacked ACK).
 
 ## 🧪 Testing
 

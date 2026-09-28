@@ -12,6 +12,7 @@
 //! EMPTY, and any nudge processes unconditionally.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::ILM;
 use std::time::Duration;
 
@@ -24,7 +25,9 @@ const SEVERAL_INTERVALS: Duration = Duration::from_millis(1200);
 async fn spawn_ilm(backend: InMemoryBackend<TestMessage>) -> impl Sized {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    ILM::new(backend, tx, network).await.expect("ILM")
+    ILM::new(backend, tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM")
 }
 
 #[citadel_io::tokio::test]
@@ -75,7 +78,9 @@ async fn a_session_with_queued_work_keeps_polling() {
     // being sent and cleared.
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     citadel_io::tokio::time::sleep(SEVERAL_INTERVALS).await;
     let after_first = backend.reads();

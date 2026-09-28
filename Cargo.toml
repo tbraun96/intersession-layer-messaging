@@ -13,6 +13,10 @@ categories = ["network-programming", "asynchronous"]
 
 [features]
 testing = []
+# Content codecs for `DynamicCompression`. Off by default; both are pure Rust
+# and build for wasm32-unknown-unknown.
+compression-brotli = ["dep:brotli"]
+compression-deflate = ["dep:flate2"]
 
 [dependencies]
 citadel_logging = { git = "https://github.com/Avarok-Cybersecurity/Citadel-Protocol", default-features = false, branch = "master" }
@@ -27,6 +31,9 @@ itertools = { version = "0.14.0", default-features = false, features = ["use_std
 dashmap = { version = "6.1.0", default-features = false, features = ["serde"] }
 auto_impl = { version = "1.2.0", default-features = false }
 num = { version = "0.4.1", default-features = false }
+brotli = { version = "8", default-features = false, features = ["std"], optional = true }
+# miniz_oxide, not zlib: the C backend does not build for wasm32.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 
 # WASM-compatible time and spawn support
 [target.'cfg(target_arch = "wasm32")'.dependencies]

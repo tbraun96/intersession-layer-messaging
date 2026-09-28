@@ -15,6 +15,7 @@
 //! operation per call whether it writes one map or five.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{MessageMetadata, Payload, ILM};
 use std::time::Duration;
 
@@ -32,7 +33,9 @@ async fn started(backend: InMemoryBackend<TestMessage>) -> (Ilm, InMemoryNetwork
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
     let inbox = network.clone();
-    let ilm = ILM::new(backend, tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend, tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
     // Let startup's own writes settle, so later counts are the message's.
     citadel_io::tokio::time::sleep(Duration::from_millis(300)).await;
     (ilm, inbox)

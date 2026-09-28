@@ -12,6 +12,7 @@
 //! stuck link rather than once per cycle.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::ILM;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,9 +58,14 @@ async fn a_blocked_peer_warns_once_however_long_it_waits() {
     let _bob_wire = network.add_peer(BOB).await;
 
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
 
     alice.send_to(BOB, b"hello".to_vec()).await.expect("queue");
 

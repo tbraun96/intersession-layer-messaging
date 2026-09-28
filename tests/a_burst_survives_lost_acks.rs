@@ -18,6 +18,8 @@
 
 use async_trait::async_trait;
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
+use intersession_layer_messaging::{InboundFrame, OutboundFrame};
 use intersession_layer_messaging::{
     MessageMetadata, NetworkError, Payload, UnderlyingSessionTransport, ILM,
 };
@@ -58,15 +60,15 @@ struct LossyAcks {
 impl UnderlyingSessionTransport for LossyAcks {
     type Message = TestMessage;
 
-    async fn next_message(&self) -> Option<Payload<Self::Message>> {
+    async fn next_message(&self) -> Option<InboundFrame<Self::Message>> {
         self.inner.next_message().await
     }
 
     async fn send_message(
         &self,
-        message: Payload<Self::Message>,
-    ) -> Result<(), NetworkError<Payload<Self::Message>>> {
-        if matches!(message, Payload::Ack { .. }) {
+        message: OutboundFrame<Self::Message>,
+    ) -> Result<(), NetworkError<OutboundFrame<Self::Message>>> {
+        if matches!(message.payload, Payload::Ack { .. }) {
             let n = self.seen.fetch_add(1, Ordering::SeqCst);
             if !n.is_multiple_of(ACK_SURVIVES_EVERY) {
                 return Ok(());
@@ -96,12 +98,22 @@ async fn a_burst_still_drains_when_most_acks_are_lost() {
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let (bob_tx, mut bob_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
 
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
-    let _bob = ILM::new(InMemoryBackend::<TestMessage>::new(), bob_tx, bob_wire)
-        .await
-        .expect("construct Bob");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
+    let _bob = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        bob_tx,
+        bob_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Bob");
 
     for n in 0..BURST {
         alice

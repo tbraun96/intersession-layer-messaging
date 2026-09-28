@@ -52,6 +52,26 @@ jobs:
       - run: rustup component add clippy-preview
       - run: cargo clippy --tests --features=testing -- -D warnings
 
+  # The codecs are off by default, so neither job above compiles them. Without
+  # this job the compression module, its bomb guard and every test that
+  # negotiates a codec would be green by never having been built.
+  codecs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: Avarok-Cybersecurity/gh-actions-deps@master
+      - uses: taiki-e/install-action@nextest
+      - run: rustup component add clippy-preview
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo nextest run --features=testing,compression-brotli,compression-deflate
+      - run: cargo clippy --tests --features=testing,compression-brotli,compression-deflate -- -D warnings
+      # Each codec alone: `DynamicCompression::All` and the codec tables are
+      # cfg-gated per feature, and one-feature builds are where those break.
+      - run: cargo clippy --tests --features=testing,compression-brotli -- -D warnings
+      - run: cargo clippy --tests --features=testing,compression-deflate -- -D warnings
+      # The browser is the reason these are pure Rust.
+      - run: cargo build --target wasm32-unknown-unknown --features=compression-brotli,compression-deflate
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 30

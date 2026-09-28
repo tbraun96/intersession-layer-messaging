@@ -13,6 +13,7 @@
 //! mechanism, and it is the first test this crate has.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -49,7 +50,9 @@ async fn messages_from_different_peers_sharing_an_id_are_both_delivered() {
     let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
 
-    let _ilm = ILM::new(backend, tx, network).await.expect("construct ILM");
+    let _ilm = ILM::new(backend, tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("construct ILM");
 
     // Collect what is delivered, with a bound so a failure reports what DID
     // arrive rather than hanging.

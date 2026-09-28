@@ -21,6 +21,7 @@
 //! as before — no worse than the old behaviour, and not fixed by this.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 use std::time::Duration;
 
@@ -60,7 +61,9 @@ async fn a_message_skipped_by_gap_patience_is_delivered_when_it_arrives() {
 
     let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     // Age id 3's receipt so held_too_long is already true for it.
     ilm.backdate_receipt_for_tests(PEER, 3, LONG_AGO);
@@ -167,7 +170,9 @@ async fn a_gap_wider_than_the_bound_only_recovers_its_head() {
 
     let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
     ilm.backdate_receipt_for_tests(PEER, FAR as usize, LONG_AGO);
 
     let deadline = Duration::from_secs(10);

@@ -30,6 +30,8 @@
 
 use async_trait::async_trait;
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
+use intersession_layer_messaging::{InboundFrame, OutboundFrame};
 use intersession_layer_messaging::{
     MessageMetadata, NetworkError, Payload, UnderlyingSessionTransport, ILM,
 };
@@ -54,15 +56,15 @@ struct SwallowsTheHead {
 impl UnderlyingSessionTransport for SwallowsTheHead {
     type Message = TestMessage;
 
-    async fn next_message(&self) -> Option<Payload<Self::Message>> {
+    async fn next_message(&self) -> Option<InboundFrame<Self::Message>> {
         self.inner.next_message().await
     }
 
     async fn send_message(
         &self,
-        message: Payload<Self::Message>,
-    ) -> Result<(), NetworkError<Payload<Self::Message>>> {
-        if let Payload::Message(m) = &message {
+        message: OutboundFrame<Self::Message>,
+    ) -> Result<(), NetworkError<OutboundFrame<Self::Message>>> {
+        if let Payload::Message(m) = &message.payload {
             if m.message_id() == 0 && self.swallowing.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -118,12 +120,22 @@ async fn the_head_is_resent_while_the_window_keeps_sending() {
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let (bob_tx, _bob_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
 
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
-    let _bob = ILM::new(InMemoryBackend::<TestMessage>::new(), bob_tx, bob_wire)
-        .await
-        .expect("construct Bob");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
+    let _bob = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        bob_tx,
+        bob_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Bob");
 
     // A trickle, not a burst: the window must never fill, or sends stop and the
     // head's clock is free to run.
