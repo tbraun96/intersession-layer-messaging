@@ -16,7 +16,7 @@ use super::CompressionError;
 /// | 1  | brotli   | feature `compression-brotli`                         |
 /// | 2  | deflate  | feature `compression-deflate` (raw deflate, no zlib)  |
 /// | 3  | rill     | RESERVED: small-frame codec, not yet in this crate   |
-/// | 4  | zstd     | RESERVED: pure-Rust no_std zstd, not yet in this crate |
+/// | 4  | zstd     | feature `compression-zstd` (magicless frames, zstd-rs) |
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Codec {
     Identity,
@@ -63,6 +63,8 @@ impl Codec {
             Codec::Brotli => Some(&super::brotli_codec::Brotli),
             #[cfg(feature = "compression-deflate")]
             Codec::Deflate => Some(&super::deflate_codec::Deflate),
+            #[cfg(feature = "compression-zstd")]
+            Codec::Zstd => Some(&super::zstd_codec::Zstd),
             _ => None,
         }
     }

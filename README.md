@@ -94,7 +94,7 @@ let options = IlmOptions {
     // standalone ACK still goes within PIGGYBACK_ACK_WINDOW (40 ms), and at
     // once after PIGGYBACK_ACK_EVERY (4) deliveries.
     piggyback_acks: true,
-    // Disabled, or (with the matching cargo features) Brotli, Deflate, All.
+    // Disabled, or (with the matching cargo features) Brotli, Deflate, Zstd, All.
     dynamic_compression: DynamicCompression::All,
 };
 ```
@@ -114,21 +114,23 @@ Every codec sits behind one pure trait (`FrameCodec`: `compress(&[u8],
 | 1  | brotli   | `compression-brotli`                      |
 | 2  | deflate  | `compression-deflate` (raw deflate)       |
 | 3  | rill     | reserved (small-frame dictionary codec)   |
-| 4  | zstd     | reserved (pure-Rust no_std zstd)          |
+| 4  | zstd     | `compression-zstd` (zstd-rs, magicless)   |
 
-Features are off by default; both implemented codecs are pure Rust and build
-for `wasm32-unknown-unknown`. Peers advertise the whole SET of codec ids they
+Features are off by default; every implemented codec is pure Rust and builds
+for `wasm32-unknown-unknown`. The browser build uses zstd + deflate: brotli
+adds ~1 MB to a wasm module, zstd-rs ~64 KB gzipped. Peers advertise the whole SET of codec ids they
 decode, so a peer with some codecs and not others is served what it has.
 
 Which codec a frame gets is one table, `compression::policy(hint, len,
 available)`: small (< 1 KiB) structured frames prefer rill, then brotli q4,
-then deflate l1; large JSON, text and Yjs prefer brotli q4, then zstd, then
+then deflate l1, then zstd (which, without a dictionary, loses to both below
+1 KiB); large JSON, text and Yjs prefer zstd level 3, then brotli q4, then
 deflate; CBOR commands wait for rill; `Opaque` and no hint are identity. A
 codec is skipped if it is not available (compiled, enabled and advertised by
-the peer) or the frame is below its floor (128 B for brotli/deflate), and a
+the peer) or the frame is below its floor (128 B for brotli/deflate/zstd), and a
 frame the chosen codec would not shrink is sent raw. A receiver refuses
-anything that expands past 16 MiB. Adding rill or zstd is a registry entry and
-a feature, not a wire change.
+anything that expands past 16 MiB. Adding rill is a registry entry and a
+feature, not a wire change.
 
 The transport encodes what ILM decides: `send_message` takes an
 `OutboundFrame` (payload plus `FrameExtensions`) and `next_message` yields an
