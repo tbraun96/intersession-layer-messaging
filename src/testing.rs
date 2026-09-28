@@ -31,9 +31,21 @@ pub struct InMemoryBackend<M: MessageMetadata> {
     /// whether it writes one key or five. Counts round trips, which is what the
     /// inbound path pays per message.
     store_ops: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(not(target_arch = "wasm32"))]
-    random_dir: std::path::PathBuf,
-    #[cfg(target_arch = "wasm32")]
+    /// The tracker's key/value state, in memory on EVERY target.
+    ///
+    /// On native this was a directory of `<key>.bin` files, so every
+    /// `store_value` was a synchronous `std::fs::write` on a tokio worker.
+    /// Two of those writes sit on a message's critical path: the sender's
+    /// `mark_sent`, issued right after the network send, and the receiver's
+    /// `record_arrival`, issued right before the inbound nudge. On
+    /// ubuntu-latest one write in a few hundred stalled for 60-250ms, and the
+    /// sender's stall held the receiver too -- its task had just been woken
+    /// into the sender's worker LIFO slot, which no other worker may steal --
+    /// so a single idle send waited out the whole write. Nothing in the nudge
+    /// path was at fault; the ILM's own test backend was blocking the runtime.
+    ///
+    /// Shared through the `Arc`, so a clone of the backend still sees the same
+    /// state -- which is all the persistence-between-sessions tests need.
     key_value_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
@@ -56,24 +68,12 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
     }
 
     pub fn new() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let random_dir = {
-            let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string() + "/");
-            if let Err(err) = std::fs::create_dir_all(&dir) {
-                log::error!(target: "ism", "Failed to create random directory: {err}");
-            }
-            dir
-        };
-
         Self {
             outbound: Arc::new(RwLock::new(HashMap::new())),
             inbound: Arc::new(RwLock::new(HashMap::new())),
             reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             clear_ops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             store_ops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(not(target_arch = "wasm32"))]
-            random_dir,
-            #[cfg(target_arch = "wasm32")]
             key_value_store: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -409,43 +409,15 @@ impl<M: MessageMetadata> InMemoryBackend<M> {
     /// `store_values_batched` can reuse it without counting a second
     /// operation -- the counter measures ROUND TRIPS, not keys.
     async fn store_value_inner(&self, key: &str, value: &[u8]) -> Result<(), BackendError<M>> {
-        // The cfg pair is load-bearing: without it BOTH blocks compile on wasm,
-        // where `std::fs` does not exist and the first block is no longer the
-        // tail expression. Native builds hid that, because the wasm block is
-        // excluded there and the unguarded one still lands last -- so the whole
-        // crate and its 269 tests passed while the wasm target could not build
-        // at all. It was lost moving these bodies out of the trait impl.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Store the bytes to the temp directory + key.bin
-            let path = self.random_dir.join(format!("{key}.bin"));
-            std::fs::write(path, value).map_err(|err| BackendError::StorageError(err.to_string()))
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Store in memory for WASM
-            let mut store = self.key_value_store.write().await;
-            store.insert(key.to_string(), value.to_vec());
-            Ok(())
-        }
+        // In memory, never the filesystem: see the field. A blocking write on
+        // a worker thread is exactly the stall this backend must not add.
+        let mut store = self.key_value_store.write().await;
+        store.insert(key.to_string(), value.to_vec());
+        Ok(())
     }
     async fn load_value_inner(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError<M>> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Load the bytes from the temp directory + key.bin
-            let path = self.random_dir.join(format!("{key}.bin"));
-            match std::fs::read(path) {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(BackendError::StorageError(err.to_string())),
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Load from memory for WASM
-            let store = self.key_value_store.read().await;
-            Ok(store.get(key).cloned())
-        }
+        let store = self.key_value_store.read().await;
+        Ok(store.get(key).cloned())
     }
 }
 
