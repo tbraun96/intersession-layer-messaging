@@ -15,6 +15,7 @@
 //! timestamp is dead weight.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::ILM;
 
 const LOCAL: usize = 0;
@@ -38,7 +39,9 @@ async fn tracker_at_ceiling() -> ILM<
     let backend = InMemoryBackend::<TestMessage>::new();
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend, tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend, tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     let tracker = ilm.tracker_for_tests();
 

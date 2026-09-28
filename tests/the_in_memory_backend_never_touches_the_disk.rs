@@ -17,6 +17,7 @@
 //! `<uuid>/` directory holding `last_sent.bin` and friends.
 use citadel_io::tokio::sync::mpsc;
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 use std::time::Duration;
 
@@ -58,10 +59,10 @@ async fn the_in_memory_backend_never_touches_the_disk() {
     let network2 = network1.add_peer(2).await;
     let (tx1, _rx1) = mpsc::unbounded_channel();
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let ilm1 = ILM::new(backend1.clone(), tx1, network1)
+    let ilm1 = ILM::new(backend1.clone(), tx1, network1, IlmOptions::LEGACY)
         .await
         .expect("ilm1");
-    let _ilm2 = ILM::new(backend2.clone(), tx2, network2)
+    let _ilm2 = ILM::new(backend2.clone(), tx2, network2, IlmOptions::LEGACY)
         .await
         .expect("ilm2");
     ilm1.send_to(2, vec![7u8]).await.expect("send");

@@ -13,6 +13,7 @@
 //! failed and a message that vanished.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 
 const LOCAL: usize = 0;
@@ -48,7 +49,9 @@ async fn a_peer_that_never_acknowledges_stops_accepting_sends() {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     // WEDGED is deliberately absent from the network: nothing drains for it.
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     let accepted: usize = fill!(ilm, WEDGED, CAP + 50);
 
@@ -79,7 +82,9 @@ async fn a_refused_send_says_so_rather_than_vanishing() {
     let backend = InMemoryBackend::<TestMessage>::new();
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     let _ = fill!(ilm, WEDGED, CAP);
 
@@ -98,7 +103,9 @@ async fn one_wedged_peer_does_not_block_sends_to_another() {
     let backend = InMemoryBackend::<TestMessage>::new();
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     let _ = fill!(ilm, WEDGED, CAP);
 

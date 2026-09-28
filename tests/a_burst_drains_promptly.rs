@@ -12,6 +12,7 @@
 //! send. Whatever it reports is a floor: the protocol's own overhead with the
 //! network taken out of the picture.
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{MessageMetadata, ILM};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -35,12 +36,22 @@ async fn a_burst_of_ninety_six_drains_in_round_trips_not_poll_intervals() {
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let (bob_tx, mut bob_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
 
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
-    let _bob = ILM::new(InMemoryBackend::<TestMessage>::new(), bob_tx, bob_wire)
-        .await
-        .expect("construct Bob");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
+    let _bob = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        bob_tx,
+        bob_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Bob");
 
     for n in 0..BURST {
         alice

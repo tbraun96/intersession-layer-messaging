@@ -29,6 +29,7 @@
 //! queue for that peer.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 use std::time::Duration;
 
@@ -76,7 +77,9 @@ async fn an_ack_clears_every_id_at_or_below_it() {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
     let inbox = network.clone();
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     // Only the highest ACK survives the link — the case SEND_WINDOW is sized
     // for. 1 and 2 are acknowledged by it, cumulatively.
@@ -134,7 +137,9 @@ async fn an_ack_leaves_higher_ids_alone() {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
     let inbox = network.clone();
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     inbox
         .send_to_peer(
@@ -200,7 +205,9 @@ async fn a_cumulative_ack_costs_one_store_operation() {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
     let inbox = network.clone();
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     inbox
         .send_to_peer(

@@ -21,6 +21,7 @@
 //! ran, or that a flag flipped, would pass against the old code too.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{Backend, MessageMetadata, ILM};
 use std::time::Duration;
 
@@ -36,7 +37,9 @@ async fn dropping_an_ilm_stops_it_touching_the_backend() {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
 
-    let ilm = ILM::new(backend.clone(), tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend.clone(), tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     // Something for the outbound loop to keep finding, so the loops have work
     // and a leak is visible as continuing activity rather than silence.

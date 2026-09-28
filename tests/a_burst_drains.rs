@@ -19,6 +19,7 @@
 //! the protocol rather than in the network it was measured on.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{MessageMetadata, ILM};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -36,12 +37,22 @@ async fn every_message_in_a_burst_reaches_the_peer() {
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let (bob_tx, mut bob_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
 
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
-    let _bob = ILM::new(InMemoryBackend::<TestMessage>::new(), bob_tx, bob_wire)
-        .await
-        .expect("construct Bob");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
+    let _bob = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        bob_tx,
+        bob_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Bob");
 
     for n in 0..BURST {
         alice

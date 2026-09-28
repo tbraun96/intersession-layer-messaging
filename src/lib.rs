@@ -6,6 +6,7 @@ use futures::{pin_mut, select, FutureExt, StreamExt};
 use itertools::Itertools;
 use local_delivery::LocalDelivery;
 use message_tracker::MessageTracker;
+use negotiation::Negotiation;
 use num::traits::NumOps;
 use num::Num;
 use serde::de::DeserializeOwned;
@@ -18,7 +19,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+pub mod capabilities;
+pub mod compression;
+pub mod frame;
 pub mod local_delivery;
+mod negotiation;
+pub mod options;
+mod wire_path;
+
+pub use capabilities::PeerCapabilities;
+pub use compression::{Codec, CompressionError, CompressionHint, DynamicCompression};
+pub use frame::{CapabilityEvidence, FrameExtensions, InboundFrame, OutboundFrame};
+pub use negotiation::{PIGGYBACK_ACK_EVERY, PIGGYBACK_ACK_WINDOW};
+pub use options::IlmOptions;
 #[cfg(feature = "testing")]
 pub mod message_tracker;
 #[cfg(not(feature = "testing"))]
@@ -196,11 +209,15 @@ pub trait MessageMetadata: Debug + Send + Sync + 'static {
 pub trait UnderlyingSessionTransport {
     type Message: MessageMetadata + Send + Sync + 'static;
 
-    async fn next_message(&self) -> Option<Payload<Self::Message>>;
+    /// The next frame from any peer. `None` only once the transport has
+    /// closed for good.
+    async fn next_message(&self) -> Option<InboundFrame<Self::Message>>;
+    /// Encode `frame` faithfully. ILM has already decided its extensions for
+    /// this peer; a transport must not add, drop or reinterpret them.
     async fn send_message(
         &self,
-        message: Payload<Self::Message>,
-    ) -> Result<(), NetworkError<Payload<Self::Message>>>;
+        frame: OutboundFrame<Self::Message>,
+    ) -> Result<(), NetworkError<OutboundFrame<Self::Message>>>;
     async fn connected_peers(&self) -> Vec<<Self::Message as MessageMetadata>::PeerId>;
     fn local_id(&self) -> <Self::Message as MessageMetadata>::PeerId;
 }
@@ -466,6 +483,9 @@ where
     /// the count was being used to guess at, and does not change meaning if a
     /// second internal clone is ever added.
     owns_background_task: bool,
+    /// What each peer may be sent beyond the legacy frames, and the ACKs
+    /// waiting to ride on the next frame to it.
+    negotiation: Arc<Negotiation<M>>,
 }
 
 impl<M, B, L, N> Drop for ILM<M, B, L, N>
@@ -504,7 +524,12 @@ where
     L: LocalDelivery<M> + Send + Sync + 'static,
     N: UnderlyingSessionTransport<Message = M> + Send + Sync + 'static,
 {
-    pub async fn new(backend: B, local_delivery: L, network: N) -> Result<Self, BackendError<M>> {
+    pub async fn new(
+        backend: B,
+        local_delivery: L,
+        network: N,
+        options: IlmOptions,
+    ) -> Result<Self, BackendError<M>> {
         let (poll_inbound_tx, poll_inbound_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel();
         let (poll_outbound_tx, poll_outbound_rx) =
             citadel_io::tokio::sync::mpsc::unbounded_channel();
@@ -524,6 +549,7 @@ where
             blocked_count: Arc::new(DashMap::new()),
             outbound_may_have_work: Arc::new(AtomicBool::new(true)),
             inbound_may_have_work: Arc::new(AtomicBool::new(true)),
+            negotiation: Arc::new(Negotiation::new(&options)),
         };
 
         this.spawn_background_tasks(poll_inbound_rx, poll_outbound_rx);
@@ -546,6 +572,7 @@ where
             outbound_may_have_work: self.outbound_may_have_work.clone(),
             inbound_may_have_work: self.inbound_may_have_work.clone(),
             owns_background_task: false,
+            negotiation: self.negotiation.clone(),
         }
     }
 
@@ -768,7 +795,7 @@ where
                 let last_received_from_peer = self.tracker.get_last_received_from(peer_id);
                 log::info!(target: "ism", "[RESYNC] Sending Poll to peer {peer_id:?} with last_received_from_peer={last_received_from_peer:?}");
                 if let Err(e) = self
-                    .send_message_internal(Payload::Poll {
+                    .send_control(Payload::Poll {
                         from_id: self.network.local_id(),
                         to_id: *peer_id,
                         last_received_from_peer,
@@ -930,7 +957,7 @@ where
                             break 'peer;
                         }
                         log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: SENDING msg_id={message_id}");
-                        if let Err(e) = self.send_message_internal(Payload::Message(msg)).await {
+                        if let Err(e) = self.send_data(msg).await {
                             log::error!(target: "ism", "[ILM-SEND] FAILED: {:?}", e);
                             // The wire refused it. Trying the next id would put
                             // a gap on a link that just failed, so stop here and
@@ -1013,8 +1040,7 @@ where
                             // link, and at one per second per peer a `warn!`
                             // has the same cost as the blocked line above.
                             log::info!(target: "ism", "[ILM-RETRANSMIT] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, unacknowledged for {current_count} cycles");
-                            if let Err(e) = self.send_message_internal(Payload::Message(msg)).await
-                            {
+                            if let Err(e) = self.send_data(msg).await {
                                 log::error!(target: "ism", "[ILM-RETRANSMIT] FAILED: {:?}", e);
                             }
                         }
@@ -1141,12 +1167,7 @@ where
                         } else {
                             log::info!(target: "ism", "[ILM-ACK] Re-ACKing already-delivered msg_id={message_id} to peer {peer_id}");
                         }
-                        if let Err(e) = self
-                            .send_message_internal(self.create_ack_message(&message))
-                            .await
-                        {
-                            log::error!(target: "ism", "[ILM-ACK] FAILED to re-ACK duplicate: {e:?}");
-                        }
+                        self.acknowledge(&message).await;
                         if let Err(e) = self
                             .backend
                             .clear_message_inbound(peer_id, message_id)
@@ -1226,12 +1247,7 @@ where
                             }
 
                             log::info!(target: "ism", "[ILM-ACK] Sending ACK for msg_id={message_id} to peer {peer_id}");
-                            if let Err(e) = self
-                                .send_message_internal(self.create_ack_message(&message))
-                                .await
-                            {
-                                log::error!(target: "ism", "[ILM-ACK] FAILED to send ACK: {e:?}");
-                            }
+                            self.acknowledge(&message).await;
 
                             if let Err(e) = self
                                 .backend
@@ -1303,11 +1319,12 @@ where
     /// Returns false once the underlying transport has closed, so the caller stops
     /// rather than spinning on a receiver that is Ready(None) forever.
     async fn process_next_network_message(&self) -> bool {
-        let Some(message) = self.network.next_message().await else {
+        let Some(frame) = self.network.next_message().await else {
             return false;
         };
+        self.absorb_extensions(&frame).await;
         {
-            match message {
+            match frame.payload {
                 Payload::Poll {
                     from_id,
                     last_received_from_peer,
@@ -1365,75 +1382,7 @@ where
                     from_id,
                     message_id,
                     to_id,
-                } => {
-                    log::info!(target: "ism", "[ILM-ACK-RECV] Received ACK from_id={from_id} msg_id={message_id} to_id={to_id} local_id={}", self.network.local_id());
-                    if to_id != self.network.local_id() {
-                        log::warn!(target: "ism", "[ILM-ACK-RECV] ACK not for us - ignoring");
-                        // Ignoring one misaddressed ACK; the transport is unaffected.
-                        return true;
-                    }
-
-                    // Update the tracker with the new ACK
-                    if let Err(err) = self.tracker.update_ack(from_id, message_id).await {
-                        log::error!(target: "ism", "[ILM-ACK-RECV] Failed to update tracker: {err:?}");
-                    } else {
-                        log::info!(target: "ism", "[ILM-ACK-RECV] Tracker updated - unblocking peer {from_id}");
-                    }
-
-                    log::trace!(target: "ism", "Received ACK from peer {from_id}, message # {message_id}");
-
-                    // Everything at or below the acked id, not just the id named.
-                    //
-                    // Acknowledgement is cumulative everywhere else in this
-                    // crate: `update_ack` keeps a high-water mark and discards
-                    // anything at or below it, the window counts in flight as
-                    // `id <= last_sent && id > last_acked`, and SEND_WINDOW is
-                    // justified on exactly that -- one surviving ACK retires the
-                    // whole window. Clearing only the named id left the rows for
-                    // ids whose own ACKs were lost sitting in the outbound store.
-                    //
-                    // Which is not merely a leak. `process_outbound` sorts
-                    // ascending and stops at the first message it cannot send,
-                    // and `can_send` is false for an id at or below
-                    // `last_acked`. The head branch that handles "cannot send"
-                    // assumes one reason for it -- sent and awaiting an ACK --
-                    // so it retransmits. The receiver dedups and re-ACKs the
-                    // same id, `update_ack` discards that as stale, and the peer
-                    // stays blocked until MAX_CONSECUTIVE_BLOCKS (fifty cycles,
-                    // ten seconds) trips BLOCKED-RECOVERY, which wipes the
-                    // peer's ack/sent state and closes the send window back to
-                    // one. Per stale row.
-                    let covered: Vec<M::MessageId> = match self.backend.get_pending_outbound().await
-                    {
-                        Ok(pending) => pending
-                            .iter()
-                            .filter(|m| {
-                                m.destination_id() == from_id && m.message_id() <= message_id
-                            })
-                            .map(|m| m.message_id())
-                            .collect(),
-                        Err(e) => {
-                            log::error!(target: "ism", "Failed to read outbound while clearing ACKed messages: {e:?}");
-                            vec![message_id]
-                        }
-                    };
-                    // One operation, not one per id. A cumulative ACK covers
-                    // the whole window it retires, and clearing them
-                    // individually cost a full queue read+write EACH on a
-                    // blob-backed store.
-                    if let Err(e) = self
-                        .backend
-                        .clear_messages_outbound(from_id, &covered)
-                        .await
-                    {
-                        log::error!(target: "ism", "Failed to clear ACKed messages {covered:?}: {e:?}");
-                    }
-
-                    // Poll any pending outbound messages
-                    if self.poll_outbound_tx.send(()).is_err() {
-                        log::warn!(target: "ism", "Failed to send poll signal for outbound messages");
-                    }
-                }
+                } => self.handle_ack(from_id, to_id, message_id).await,
                 Payload::Message(msg) => {
                     if msg.destination_id() != self.network.local_id() {
                         log::warn!(target: "ism", "Received message for another peer");
@@ -1483,12 +1432,7 @@ where
                             .tracker
                             .safe_to_ack(&msg.source_id(), &msg.message_id())
                         {
-                            if let Err(e) = self
-                                .send_message_internal(self.create_ack_message(&msg))
-                                .await
-                            {
-                                log::error!(target: "ism", "Failed to send ACK for duplicate message: {e:?}");
-                            }
+                            self.acknowledge(&msg).await;
                         } else {
                             // Nudge the inbound loop instead: the gap this one
                             // is waiting behind may have just been filled by the
@@ -1524,12 +1468,95 @@ where
         true
     }
 
+    /// A cumulative ACK from `from_id`, standalone or folded into a data frame.
+    async fn handle_ack(&self, from_id: M::PeerId, to_id: M::PeerId, message_id: M::MessageId) {
+        log::info!(target: "ism", "[ILM-ACK-RECV] Received ACK from_id={from_id} msg_id={message_id} to_id={to_id} local_id={}", self.network.local_id());
+        if to_id != self.network.local_id() {
+            log::warn!(target: "ism", "[ILM-ACK-RECV] ACK not for us - ignoring");
+            // Ignoring one misaddressed ACK; the transport is unaffected.
+            return;
+        }
+
+        // Update the tracker with the new ACK
+        if let Err(err) = self.tracker.update_ack(from_id, message_id).await {
+            log::error!(target: "ism", "[ILM-ACK-RECV] Failed to update tracker: {err:?}");
+        } else {
+            log::info!(target: "ism", "[ILM-ACK-RECV] Tracker updated - unblocking peer {from_id}");
+        }
+
+        log::trace!(target: "ism", "Received ACK from peer {from_id}, message # {message_id}");
+
+        // Everything at or below the acked id, not just the id named.
+        //
+        // Acknowledgement is cumulative everywhere else in this
+        // crate: `update_ack` keeps a high-water mark and discards
+        // anything at or below it, the window counts in flight as
+        // `id <= last_sent && id > last_acked`, and SEND_WINDOW is
+        // justified on exactly that -- one surviving ACK retires the
+        // whole window. Clearing only the named id left the rows for
+        // ids whose own ACKs were lost sitting in the outbound store.
+        //
+        // Which is not merely a leak. `process_outbound` sorts
+        // ascending and stops at the first message it cannot send,
+        // and `can_send` is false for an id at or below
+        // `last_acked`. The head branch that handles "cannot send"
+        // assumes one reason for it -- sent and awaiting an ACK --
+        // so it retransmits. The receiver dedups and re-ACKs the
+        // same id, `update_ack` discards that as stale, and the peer
+        // stays blocked until MAX_CONSECUTIVE_BLOCKS (fifty cycles,
+        // ten seconds) trips BLOCKED-RECOVERY, which wipes the
+        // peer's ack/sent state and closes the send window back to
+        // one. Per stale row.
+        let covered: Vec<M::MessageId> = match self.backend.get_pending_outbound().await {
+            Ok(pending) => pending
+                .iter()
+                .filter(|m| m.destination_id() == from_id && m.message_id() <= message_id)
+                .map(|m| m.message_id())
+                .collect(),
+            Err(e) => {
+                log::error!(target: "ism", "Failed to read outbound while clearing ACKed messages: {e:?}");
+                vec![message_id]
+            }
+        };
+        // One operation, not one per id. A cumulative ACK covers
+        // the whole window it retires, and clearing them
+        // individually cost a full queue read+write EACH on a
+        // blob-backed store.
+        if let Err(e) = self
+            .backend
+            .clear_messages_outbound(from_id, &covered)
+            .await
+        {
+            log::error!(target: "ism", "Failed to clear ACKed messages {covered:?}: {e:?}");
+        }
+
+        // Poll any pending outbound messages
+        if self.poll_outbound_tx.send(()).is_err() {
+            log::warn!(target: "ism", "Failed to send poll signal for outbound messages");
+        }
+        self.negotiation.forget_hints_through(from_id, message_id);
+    }
+
     /// The preferred entrypoint for sending messages. Unlike `[Self::send_raw_message]`, this
     /// ensures the message is properly created
     pub async fn send_to(
         &self,
         to: M::PeerId,
         contents: impl Into<M::Contents>,
+    ) -> Result<(), NetworkError<M>> {
+        self.send_to_with_hint(to, contents, None).await
+    }
+
+    /// `send_to`, saying what the contents are so they can be compressed.
+    ///
+    /// `None` means "do not compress", exactly as `send_to`. A hint is used
+    /// only toward a peer that has advertised a codec this node also enabled;
+    /// toward any other peer the frame is the legacy one.
+    pub async fn send_to_with_hint(
+        &self,
+        to: M::PeerId,
+        contents: impl Into<M::Contents>,
+        hint: Option<CompressionHint>,
     ) -> Result<(), NetworkError<M>> {
         let my_id = self.network.local_id();
         let next_id_for_this_peer_conn = self
@@ -1538,9 +1565,16 @@ where
             .await
             .map_err(|err| NetworkError::BackendError(err))?;
         let message = M::construct_from_parts(my_id, to, next_id_for_this_peer_conn, contents);
+        // Recorded before the message is queued: the outbound loop may send
+        // it the instant it is stored.
+        if let Some(hint) = hint {
+            self.negotiation
+                .record_hint(to, next_id_for_this_peer_conn, hint);
+        }
         match self.send_raw_message(message).await {
             Ok(()) => Ok(()),
             Err(err) => {
+                self.negotiation.forget_hint(to, next_id_for_this_peer_conn);
                 // The id was minted above but the message never entered the
                 // queue, so nothing will ever carry it. The receiver consumes
                 // ids in order: it would hold the NEXT message behind the
@@ -1642,15 +1676,6 @@ where
         }
     }
 
-    fn create_ack_message(&self, original_message: &M) -> Payload<M> {
-        // Must send an ACK back with a flipped order of the source and destination
-        Payload::Ack {
-            from_id: original_message.destination_id(),
-            to_id: original_message.source_id(),
-            message_id: original_message.message_id(),
-        }
-    }
-
     /// Shutdown the message system gracefully
     /// This will stop the background tasks and wait for pending outbound messages to be processed
     pub async fn shutdown(&self, timeout: Duration) -> Result<(), NetworkError<M>> {
@@ -1727,9 +1752,9 @@ where
 
     async fn send_message_internal(
         &self,
-        message: Payload<M>,
-    ) -> Result<(), NetworkError<Payload<M>>> {
-        let res = self.network.send_message(message).await;
+        frame: OutboundFrame<M>,
+    ) -> Result<(), NetworkError<OutboundFrame<M>>> {
+        let res = self.network.send_message(frame).await;
 
         if res.is_err() {
             // Since I/O is corrupt, there is no chance of safe shutdown or recovery

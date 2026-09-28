@@ -12,6 +12,8 @@
 
 use async_trait::async_trait;
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
+use intersession_layer_messaging::{InboundFrame, OutboundFrame};
 use intersession_layer_messaging::{
     MessageMetadata, NetworkError, Payload, UnderlyingSessionTransport, ILM,
 };
@@ -36,15 +38,15 @@ struct DropsFirstAttempt {
 impl UnderlyingSessionTransport for DropsFirstAttempt {
     type Message = TestMessage;
 
-    async fn next_message(&self) -> Option<Payload<Self::Message>> {
+    async fn next_message(&self) -> Option<InboundFrame<Self::Message>> {
         self.inner.next_message().await
     }
 
     async fn send_message(
         &self,
-        message: Payload<Self::Message>,
-    ) -> Result<(), NetworkError<Payload<Self::Message>>> {
-        if let Payload::Message(inner_message) = &message {
+        message: OutboundFrame<Self::Message>,
+    ) -> Result<(), NetworkError<OutboundFrame<Self::Message>>> {
+        if let Payload::Message(inner_message) = &message.payload {
             let id = inner_message.message_id();
             // A dropped packet reports success: the sender cannot tell.
             if self.dropped.lock().await.insert(id) {
@@ -75,12 +77,22 @@ async fn every_message_arrives_when_its_first_transmission_is_lost() {
     let (alice_tx, _alice_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let (bob_tx, mut bob_rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
 
-    let alice = ILM::new(InMemoryBackend::<TestMessage>::new(), alice_tx, alice_wire)
-        .await
-        .expect("construct Alice");
-    let _bob = ILM::new(InMemoryBackend::<TestMessage>::new(), bob_tx, bob_wire)
-        .await
-        .expect("construct Bob");
+    let alice = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        alice_tx,
+        alice_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Alice");
+    let _bob = ILM::new(
+        InMemoryBackend::<TestMessage>::new(),
+        bob_tx,
+        bob_wire,
+        IlmOptions::LEGACY,
+    )
+    .await
+    .expect("construct Bob");
 
     for n in 0..BURST {
         alice

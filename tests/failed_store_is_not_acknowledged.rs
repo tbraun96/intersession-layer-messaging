@@ -13,9 +13,11 @@
 //! message that was never stored is the exact moment the content is lost.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::{
     Backend, BackendError, MessageMetadata, Payload, UnderlyingSessionTransport, ILM,
 };
+use intersession_layer_messaging::{InboundFrame, OutboundFrame};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,7 +108,10 @@ async fn next_ack(alice: &InMemoryNetwork<TestMessage>, within: Duration) -> Opt
         match citadel_io::tokio::time::timeout(Duration::from_millis(250), alice.next_message())
             .await
         {
-            Ok(Some(Payload::Ack { message_id, .. })) => return Some(message_id),
+            Ok(Some(InboundFrame {
+                payload: Payload::Ack { message_id, .. },
+                ..
+            })) => return Some(message_id),
             Ok(Some(_)) => continue,
             Ok(None) => return None,
             Err(_) => continue,
@@ -125,14 +130,14 @@ async fn a_message_whose_store_failed_is_never_acknowledged() {
     let local = network.add_peer(LOCAL).await;
 
     let (tx, mut rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
-    let _ilm = ILM::new(backend.clone(), tx, local)
+    let _ilm = ILM::new(backend.clone(), tx, local, IlmOptions::LEGACY)
         .await
         .expect("construct ILM");
 
     // Alice's delivery arrives while our storage is failing.
     backend.arm();
     alice
-        .send_message(Payload::Message(message.clone()))
+        .send_message(OutboundFrame::legacy(Payload::Message(message.clone())))
         .await
         .expect("alice sends");
 
@@ -155,7 +160,7 @@ async fn a_message_whose_store_failed_is_never_acknowledged() {
     // Storage recovers and Alice retransmits, as she will while un-acked.
     backend.disarm();
     alice
-        .send_message(Payload::Message(message))
+        .send_message(OutboundFrame::legacy(Payload::Message(message)))
         .await
         .expect("alice retransmits");
 

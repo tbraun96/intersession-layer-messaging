@@ -30,6 +30,7 @@
 //! timer. Only counting the polls actually observes the defect.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::ILM;
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ async fn a_closed_transport_does_not_spin_the_listener() {
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
 
-    let ilm = ILM::new(backend, tx, network.clone())
+    let ilm = ILM::new(backend, tx, network.clone(), IlmOptions::LEGACY)
         .await
         .expect("construct ILM");
 

@@ -17,6 +17,7 @@
 //! caller mints first.
 
 use intersession_layer_messaging::testing::{InMemoryBackend, InMemoryNetwork, TestMessage};
+use intersession_layer_messaging::IlmOptions;
 use intersession_layer_messaging::ILM;
 
 const LOCAL: usize = 0;
@@ -29,7 +30,9 @@ async fn a_refused_send_leaves_the_counter_alone() {
     let backend = InMemoryBackend::<TestMessage>::new();
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend, tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend, tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     let before = ilm.peek_next_id_for_tests(PEER);
 
@@ -70,7 +73,9 @@ async fn a_successful_send_still_consumes_its_id() {
     let backend = InMemoryBackend::<TestMessage>::new();
     let (tx, _rx) = citadel_io::tokio::sync::mpsc::unbounded_channel::<TestMessage>();
     let network = InMemoryNetwork::<TestMessage>::new().add_peer(LOCAL).await;
-    let ilm = ILM::new(backend, tx, network).await.expect("ILM");
+    let ilm = ILM::new(backend, tx, network, IlmOptions::LEGACY)
+        .await
+        .expect("ILM");
 
     let before = ilm.peek_next_id_for_tests(PEER);
     ilm.send_to(PEER, b"hello".to_vec())
