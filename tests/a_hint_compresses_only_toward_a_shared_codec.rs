@@ -73,7 +73,8 @@ async fn only_a_hinted_message_is_compressed_and_an_unhinted_one_is_the_legacy_f
             piggybacked_ack: None,
             compression: Some(CompressionPlan {
                 hint: CompressionHint::Json,
-                codecs: CodecSet::of(&[Codec::Brotli, Codec::Deflate]),
+                // Everything compiled: zstd too, when this build has it.
+                codecs: CodecSet::compiled(),
             }),
         }
     );
@@ -124,6 +125,64 @@ async fn a_peer_with_a_subset_of_codecs_is_offered_only_that_subset() {
             compression: Some(CompressionPlan {
                 hint: CompressionHint::YjsUpdate,
                 codecs: CodecSet::of(&[Codec::Deflate]),
+            }),
+        }
+    );
+}
+
+/// The browser's case: its build has zstd and deflate but no brotli, so a
+/// native peer with all three offers it exactly the codecs it has.
+#[cfg(feature = "compression-zstd")]
+#[citadel_io::tokio::test]
+async fn a_peer_without_brotli_is_offered_zstd_and_a_large_frame_arrives_whole() {
+    let network = InMemoryNetwork::<TestMessage>::new();
+    let alice_wire = Recorder::new(network.add_peer(ALICE).await);
+    let bob_wire = Recorder::new(network.add_peer(BOB).await);
+    let (alice_tx, _alice_inbox) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+    let (bob_tx, mut bob_inbox) = citadel_io::tokio::sync::mpsc::unbounded_channel();
+    let alice = ILM::new(
+        InMemoryBackend::new(),
+        alice_tx,
+        alice_wire.clone(),
+        EVERYTHING,
+    )
+    .await
+    .expect("alice");
+    let zstd_only = IlmOptions {
+        piggyback_acks: false,
+        dynamic_compression: DynamicCompression::Zstd,
+    };
+    let _bob = ILM::new(InMemoryBackend::new(), bob_tx, bob_wire, zstd_only)
+        .await
+        .expect("bob");
+    assert!(eventually(Duration::from_secs(2), || alice_wire.heard_advertisement()).await);
+
+    let large = json(3).repeat(20);
+    alice
+        .send_to_with_hint(BOB, large.clone(), Some(CompressionHint::Json))
+        .await
+        .expect("hinted");
+    use intersession_layer_messaging::MessageMetadata;
+    assert_eq!(
+        receive(&mut bob_inbox, Duration::from_secs(3))
+            .await
+            .contents(),
+        &large
+    );
+
+    let sent = alice_wire
+        .sent()
+        .await
+        .into_iter()
+        .find(|s| matches!(s.kind, Kind::Message(_)))
+        .expect("alice sent it");
+    assert_eq!(
+        sent.extensions,
+        FrameExtensions::Negotiated {
+            piggybacked_ack: None,
+            compression: Some(CompressionPlan {
+                hint: CompressionHint::Json,
+                codecs: CodecSet::of(&[Codec::Zstd]),
             }),
         }
     );

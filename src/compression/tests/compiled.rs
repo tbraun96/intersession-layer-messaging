@@ -8,6 +8,8 @@ fn compiled_codecs() -> Vec<Codec> {
         Codec::Brotli,
         #[cfg(feature = "compression-deflate")]
         Codec::Deflate,
+        #[cfg(feature = "compression-zstd")]
+        Codec::Zstd,
     ]
     .to_vec()
 }
@@ -144,8 +146,9 @@ fn malformed_input_is_an_error_not_a_panic() {
                 );
             }
         }
-        // Brotli's stream header is strict enough that noise must not parse.
-        if codec == Codec::Brotli {
+        // Brotli's stream header, and zstd's frame header plus declared
+        // content size, are strict enough that noise must not parse.
+        if matches!(codec, Codec::Brotli | Codec::Zstd) {
             assert!(matches!(
                 decode(codec, incompressible(512)),
                 Err(CompressionError::Malformed(_))

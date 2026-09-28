@@ -2,8 +2,15 @@ use super::*;
 
 mod policy_table;
 
-#[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
+#[cfg(any(
+    feature = "compression-brotli",
+    feature = "compression-deflate",
+    feature = "compression-zstd"
+))]
 mod compiled;
+
+#[cfg(feature = "compression-zstd")]
+mod zstd;
 
 pub(super) fn json_like(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
@@ -71,18 +78,14 @@ fn identity_passes_bytes_through_untouched() {
 }
 
 #[test]
-fn reserved_codecs_are_refused_rather_than_misread() {
-    for codec in [Codec::Rill, Codec::Zstd] {
-        assert!(
-            codec.implementation().is_none(),
-            "{codec:?} is only reserved"
-        );
-        assert!(!CodecSet::compiled().contains(codec));
-        assert_eq!(
-            decode(codec, vec![1, 2, 3]),
-            Err(CompressionError::NotCompiled(codec))
-        );
-    }
+fn a_reserved_codec_is_refused_rather_than_misread() {
+    let rill = Codec::Rill;
+    assert!(rill.implementation().is_none(), "rill is only reserved");
+    assert!(!CodecSet::compiled().contains(rill));
+    assert_eq!(
+        decode(rill, vec![1, 2, 3]),
+        Err(CompressionError::NotCompiled(rill))
+    );
 }
 
 #[cfg(not(feature = "compression-brotli"))]
@@ -103,4 +106,14 @@ fn a_build_without_deflate_refuses_deflate_rather_than_misreading_it() {
         Err(CompressionError::NotCompiled(Codec::Deflate))
     );
     assert!(!CodecSet::compiled().contains(Codec::Deflate));
+}
+
+#[cfg(not(feature = "compression-zstd"))]
+#[test]
+fn a_build_without_zstd_refuses_zstd_rather_than_misreading_it() {
+    assert_eq!(
+        decode(Codec::Zstd, vec![1, 2, 3]),
+        Err(CompressionError::NotCompiled(Codec::Zstd))
+    );
+    assert!(!CodecSet::compiled().contains(Codec::Zstd));
 }

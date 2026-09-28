@@ -63,14 +63,17 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: rustup component add clippy-preview
       - run: rustup target add wasm32-unknown-unknown
-      - run: cargo nextest run --features=testing,compression-brotli,compression-deflate
-      - run: cargo clippy --tests --features=testing,compression-brotli,compression-deflate -- -D warnings
+      - run: cargo nextest run --features=testing,compression-brotli,compression-deflate,compression-zstd
+      - run: cargo clippy --tests --features=testing,compression-brotli,compression-deflate,compression-zstd -- -D warnings
       # Each codec alone: `DynamicCompression::All` and the codec tables are
       # cfg-gated per feature, and one-feature builds are where those break.
       - run: cargo clippy --tests --features=testing,compression-brotli -- -D warnings
       - run: cargo clippy --tests --features=testing,compression-deflate -- -D warnings
+      - run: cargo clippy --tests --features=testing,compression-zstd -- -D warnings
+      # The browser's set: zstd and deflate, no brotli.
+      - run: cargo nextest run --features=testing,compression-zstd,compression-deflate
       # The browser is the reason these are pure Rust.
-      - run: cargo build --target wasm32-unknown-unknown --features=compression-brotli,compression-deflate
+      - run: cargo build --target wasm32-unknown-unknown --features=compression-brotli,compression-deflate,compression-zstd
 
   fmt:
     runs-on: ubuntu-latest

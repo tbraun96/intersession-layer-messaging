@@ -1,11 +1,11 @@
 //! Per-message compression of a data frame's contents.
 //!
 //! The application says what a payload IS (`CompressionHint`); this module
-//! decides what that is worth. Measured on the workspace's own traffic, brotli
-//! at quality 4 / lgwin 18 had the best ratio for every class that compresses
-//! at all (JSON 0.19, markdown 0.46, Yjs 0.25) and raw deflate at level 1 is
-//! the CPU-cheap fallback. CBOR chat commands only pay with a shared
-//! dictionary, which does not exist yet, so they are sent as they are.
+//! decides what that is worth, in `policy`'s one table. Large JSON, text and
+//! Yjs go to zstd level 3 first (within 1-4% of brotli q4's ratio, and about
+//! 3x faster both ways in V8), then brotli, then raw deflate level 1 as the
+//! CPU-cheap fallback. CBOR chat commands only pay with a shared dictionary,
+//! which does not exist yet, so they are sent as they are.
 //!
 //! Codecs are cargo features and off by default. The wire id of every codec
 //! exists regardless, so a build without a codec can still NAME it -- to refuse
@@ -22,6 +22,8 @@ mod deflate_codec;
 #[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
 mod limit;
 mod policy;
+#[cfg(feature = "compression-zstd")]
+mod zstd_codec;
 
 pub use codec::{Codec, CodecSet, FrameCodec, Params};
 pub use policy::{can_compress, policy, CodecChoice, IDENTITY, SMALL_FRAME_LIMIT};
@@ -87,8 +89,14 @@ pub enum DynamicCompression {
     Brotli,
     #[cfg(feature = "compression-deflate")]
     Deflate,
+    #[cfg(feature = "compression-zstd")]
+    Zstd,
     /// Every compiled codec; `policy` picks among those the peer also has.
-    #[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
+    #[cfg(any(
+        feature = "compression-brotli",
+        feature = "compression-deflate",
+        feature = "compression-zstd"
+    ))]
     All,
 }
 
@@ -101,7 +109,13 @@ impl DynamicCompression {
             DynamicCompression::Brotli => CodecSet::of(&[Codec::Brotli]),
             #[cfg(feature = "compression-deflate")]
             DynamicCompression::Deflate => CodecSet::of(&[Codec::Deflate]),
-            #[cfg(any(feature = "compression-brotli", feature = "compression-deflate"))]
+            #[cfg(feature = "compression-zstd")]
+            DynamicCompression::Zstd => CodecSet::of(&[Codec::Zstd]),
+            #[cfg(any(
+                feature = "compression-brotli",
+                feature = "compression-deflate",
+                feature = "compression-zstd"
+            ))]
             DynamicCompression::All => CodecSet::compiled(),
         }
     }
