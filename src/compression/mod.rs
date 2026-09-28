@@ -2,8 +2,8 @@
 //!
 //! The application says what a payload IS (`CompressionHint`); this module
 //! decides what that is worth, in `policy`'s one table. Large JSON, text and
-//! Yjs go to zstd level 3 first (the same ratio as brotli q4 within 1-4%, and
-//! 3-4x faster both ways in V8), then brotli, then raw deflate level 1 as the
+//! Yjs go to zstd level 3 first (within 1-4% of brotli q4's ratio, and about
+//! 3x faster both ways in V8), then brotli, then raw deflate level 1 as the
 //! CPU-cheap fallback. CBOR chat commands only pay with a shared dictionary,
 //! which does not exist yet, so they are sent as they are.
 //!

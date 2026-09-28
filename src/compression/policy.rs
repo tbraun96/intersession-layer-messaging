@@ -9,8 +9,9 @@
 //!
 //! Large frames (>= 1 KiB) rank zstd first: without a dictionary its ratio is
 //! within 1-4% of brotli q4 (ws-json 0.196 vs 0.194, Yjs snapshots 0.122 vs
-//! 0.115, markdown 0.48 vs 0.46) at 3-4x the speed both ways in V8, and it is
-//! the codec the browser can afford to ship.
+//! 0.115, markdown 0.48 vs 0.46) at about 3x the speed in V8 (compress
+//! 3.4-3.6x, decompress 2.6-3.4x), and it is the codec the browser can afford
+//! to ship.
 //!
 //! Small frames (< 1 KiB) do NOT rank zstd first, because without a
 //! dictionary it does not pay there. Per frame size on the corpus (ratio,
