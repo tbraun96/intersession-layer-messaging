@@ -748,16 +748,16 @@ where
             );
             select! {
                 _ = outbound_handle_fused => {
-                    log::error!(target: "ism", "Outbound processing task prematurely ended");
+                    this.log_task_ended("Outbound processing");
                 },
                 _ = inbound_handle_fused => {
-                    log::error!(target: "ism", "Inbound processing task prematurely ended");
+                    this.log_task_ended("Inbound processing");
                 },
                 _ = network_io_handle_fused => {
-                    log::error!(target: "ism", "Network IO task prematurely ended");
+                    this.log_task_ended("Network IO");
                 },
                 _ = peer_polling_handle_fused => {
-                    log::error!(target: "ism", "Peer polling task prematurely ended");
+                    this.log_task_ended("Peer polling");
                 },
             }
 
@@ -1746,6 +1746,15 @@ where
 
     fn can_run(&self) -> bool {
         self.is_running.load(Ordering::Relaxed)
+    }
+
+    /// A task ending after `toggle_off` is the normal shutdown; before it, something died.
+    fn log_task_ended(&self, task: &str) {
+        if self.can_run() {
+            log::error!(target: "ism", "{task} task prematurely ended");
+        } else {
+            log::info!(target: "ism", "{task} task ended: the message system was toggled off");
+        }
     }
 
     fn toggle_off(&self) {
