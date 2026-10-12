@@ -40,10 +40,20 @@ pub mod message_tracker;
 pub(crate) mod message_tracker;
 
 #[cfg(feature = "testing")]
+pub mod peer_backoff;
+#[cfg(not(feature = "testing"))]
+pub(crate) mod peer_backoff;
+
+#[cfg(feature = "testing")]
 pub mod testing;
 
 const OUTBOUND_POLL: Duration = Duration::from_millis(200);
 const INBOUND_POLL: Duration = Duration::from_millis(200);
+
+/// How outbound sends to an unreachable peer are spaced: one cycle after the
+/// first failure, doubling to a ceiling of 25 cycles (about five seconds) so a
+/// peer that returns is never kept waiting long even if nothing announces it.
+const OUTBOUND_BACKOFF: peer_backoff::BackoffPolicy = peer_backoff::BackoffPolicy::new(1, 25);
 
 /// Platform-agnostic async sleep function
 /// - Native: Uses tokio::time::sleep
@@ -461,6 +471,8 @@ where
     known_peers: Arc<Mutex<Vec<M::PeerId>>>,
     /// Tracks consecutive block counts per peer for fallback clearing
     blocked_count: Arc<DashMap<M::PeerId, u32>>,
+    /// Spaces out sends to peers that are absent or whose stream is dead.
+    backoff: Arc<peer_backoff::PeerBackoff<M::PeerId>>,
     /// Whether each queue might hold something, so an idle session stops
     /// paying for the poll that proves it does not.
     ///
@@ -549,6 +561,7 @@ where
             poll_outbound_tx,
             known_peers: Arc::new(Mutex::new(Vec::new())),
             blocked_count: Arc::new(DashMap::new()),
+            backoff: Arc::new(peer_backoff::PeerBackoff::new(OUTBOUND_BACKOFF)),
             outbound_may_have_work: Arc::new(AtomicBool::new(true)),
             inbound_may_have_work: Arc::new(AtomicBool::new(true)),
             negotiation: Arc::new(Negotiation::new(&options)),
@@ -571,6 +584,7 @@ where
             poll_outbound_tx: self.poll_outbound_tx.clone(),
             known_peers: self.known_peers.clone(),
             blocked_count: self.blocked_count.clone(),
+            backoff: self.backoff.clone(),
             outbound_may_have_work: self.outbound_may_have_work.clone(),
             inbound_may_have_work: self.inbound_may_have_work.clone(),
             owns_background_task: false,
@@ -639,6 +653,10 @@ where
                     let mut wake = wake;
                     while poll_outbound_rx.try_recv().is_ok() {
                         wake = Wake::Nudged;
+                    }
+
+                    if matches!(wake, Wake::Timer) {
+                        this.backoff.tick();
                     }
 
                     // An idle session used to pay a full queue read ten times a
@@ -807,6 +825,9 @@ where
                     log::error!(target: "ism", "Failed to send poll to new peer: {e:?}");
                     break;
                 }
+                // The resync reached it, so the stream is alive: whatever
+                // pacing earlier failures earned is over.
+                self.backoff.recovered(peer_id);
             }
 
             *current_peers_lock = connected_peers_now;
@@ -860,7 +881,20 @@ where
         futures::stream::iter(grouped_messages).for_each_concurrent(None, |(peer_id, messages)|  {
             async move {
                 if !connected_peers.contains(&peer_id) {
-                    log::warn!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: Peer {peer_id} is not connected, skipping {} messages", messages.len());
+                    // Announced on the transition only: this cycle repeats
+                    // five times a second for as long as the peer stays away.
+                    if self.backoff.found_unreachable(peer_id) {
+                        log::warn!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: Peer {peer_id} is not connected, holding {} messages until it is", messages.len());
+                    } else {
+                        log::debug!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: Peer {peer_id} is still not connected, holding {} messages", messages.len());
+                    }
+                    return;
+                }
+                if self.backoff.found_reachable(&peer_id) {
+                    log::info!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: Peer {peer_id} is connected again");
+                }
+                if self.backoff.is_cooling(&peer_id) {
+                    log::debug!(target: "ism", "[ILM-OUTBOUND] CID {local_cid}: Peer {peer_id} is backing off, holding {} messages", messages.len());
                     return;
                 }
 
@@ -960,13 +994,20 @@ where
                         }
                         log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: SENDING msg_id={message_id}");
                         if let Err(e) = self.send_data(msg).await {
-                            log::error!(target: "ism", "[ILM-SEND] FAILED: {:?}", e);
+                            if self.backoff.send_failed(peer_id) {
+                                log::error!(target: "ism", "[ILM-SEND] FAILED: {:?}; backing off, messages stay queued", e);
+                            } else {
+                                log::debug!(target: "ism", "[ILM-SEND] FAILED again: {:?}", e);
+                            }
                             // The wire refused it. Trying the next id would put
                             // a gap on a link that just failed, so stop here and
                             // let the next cycle retry this same id.
                             break 'peer;
                         } else {
                             log::info!(target: "ism", "[ILM-SEND] SUCCESS: msg_id={message_id}");
+                            if self.backoff.recovered(&peer_id) {
+                                log::info!(target: "ism", "[ILM-SEND] CID {local_cid} -> peer {peer_id}: sends succeed again");
+                            }
                             if let Err(err) = self.tracker.mark_sent(peer_id, message_id).await {
                                 log::error!(target: "ism", "Failed to mark message as sent: {err:?}");
                             }
@@ -1043,7 +1084,11 @@ where
                             // has the same cost as the blocked line above.
                             log::info!(target: "ism", "[ILM-RETRANSMIT] CID {local_cid} -> peer {peer_id}: msg_id={message_id}, unacknowledged for {current_count} cycles");
                             if let Err(e) = self.send_data(msg).await {
-                                log::error!(target: "ism", "[ILM-RETRANSMIT] FAILED: {:?}", e);
+                                if self.backoff.send_failed(peer_id) {
+                                    log::error!(target: "ism", "[ILM-RETRANSMIT] FAILED: {:?}; backing off, messages stay queued", e);
+                                } else {
+                                    log::debug!(target: "ism", "[ILM-RETRANSMIT] FAILED again: {:?}", e);
+                                }
                             }
                         }
 
@@ -1325,6 +1370,9 @@ where
             return false;
         };
         self.absorb_extensions(&frame).await;
+        // A frame from the peer proves its stream is alive, whatever the last
+        // send to it did: whatever pacing its failures earned is over.
+        self.backoff.recovered(&frame.payload.source_id());
         {
             match frame.payload {
                 Payload::Poll {

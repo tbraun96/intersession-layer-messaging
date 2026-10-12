@@ -158,3 +158,5 @@ where
         citadel_io::tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+pub mod log_capture;
