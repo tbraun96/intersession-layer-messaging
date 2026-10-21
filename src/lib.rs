@@ -1787,6 +1787,14 @@ where
             .collect::<Vec<_>>()
     }
 
+    /// What this node may use toward `peer`: what both enabled and the peer
+    /// last advertised. `LEGACY` for a peer that has not advertised, or whose
+    /// latest Ack or Poll carried no advertisement. A layer above that sends a
+    /// kind of payload only some peers can read asks this before each send.
+    pub fn peer_capabilities(&self, peer: M::PeerId) -> PeerCapabilities {
+        self.negotiation.shared(&peer)
+    }
+
     /// Returns the ID of this node in the network
     pub fn local_id(&self) -> M::PeerId {
         self.network.local_id()

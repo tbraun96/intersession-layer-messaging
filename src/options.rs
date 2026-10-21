@@ -19,6 +19,10 @@ pub struct IlmOptions {
     /// only if its sender supplied a `CompressionHint` that calls for it, and
     /// only with a codec the receiving peer has advertised.
     pub dynamic_compression: DynamicCompression,
+    /// Advertise `PeerCapabilities::INTERNAL_HTTP`: the node above this ILM
+    /// reads `citadel-ihttp/1` envelopes. Changes nothing ILM sends but the
+    /// advertisement itself.
+    pub internal_http: bool,
 }
 
 impl IlmOptions {
@@ -28,5 +32,6 @@ impl IlmOptions {
     pub const LEGACY: Self = Self {
         piggyback_acks: false,
         dynamic_compression: DynamicCompression::Disabled,
+        internal_http: false,
     };
 }

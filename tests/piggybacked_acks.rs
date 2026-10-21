@@ -21,6 +21,7 @@ use support::pair::{ALICE, BOB};
 const PIGGYBACK: IlmOptions = IlmOptions {
     piggyback_acks: true,
     dynamic_compression: DynamicCompression::Disabled,
+    internal_http: false,
 };
 
 #[citadel_io::tokio::test]
