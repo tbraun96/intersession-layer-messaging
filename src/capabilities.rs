@@ -23,8 +23,13 @@ pub struct PeerCapabilities {
 impl PeerCapabilities {
     /// The receiver folds a piggybacked cumulative ACK out of a data frame.
     pub const PIGGYBACK_ACKS: u8 = 0b0000_0001;
+    /// The receiver reads `citadel-ihttp/1` envelopes (internal HTTP between
+    /// Citadel apps) and hands them to its app host rather than to a chat. ILM
+    /// never builds such an envelope itself: the flag is advertised for the
+    /// layer above, which must not send one to a peer without it.
+    pub const INTERNAL_HTTP: u8 = 0b0000_0010;
 
-    const KNOWN_FLAGS: u8 = Self::PIGGYBACK_ACKS;
+    const KNOWN_FLAGS: u8 = Self::PIGGYBACK_ACKS | Self::INTERNAL_HTTP;
 
     /// Nothing beyond the legacy frames: what every peer is until it says otherwise.
     pub const LEGACY: Self = Self {
@@ -69,6 +74,22 @@ impl PeerCapabilities {
         self.flags & Self::PIGGYBACK_ACKS != 0
     }
 
+    pub const fn carries_internal_http(self) -> bool {
+        self.flags & Self::INTERNAL_HTTP != 0
+    }
+
+    /// The same capabilities with `INTERNAL_HTTP` set or cleared.
+    pub const fn with_internal_http(self, on: bool) -> Self {
+        Self {
+            flags: if on {
+                self.flags | Self::INTERNAL_HTTP
+            } else {
+                self.flags & !Self::INTERNAL_HTTP
+            },
+            codecs: self.codecs,
+        }
+    }
+
     pub const fn decodes(self, codec: Codec) -> bool {
         self.codecs.contains(codec)
     }
@@ -94,6 +115,7 @@ impl PeerCapabilities {
                 .codecs()
                 .intersect(CodecSet::compiled()),
         )
+        .with_internal_http(options.internal_http)
     }
 }
 
@@ -117,8 +139,28 @@ mod tests {
         let options = IlmOptions {
             piggyback_acks: false,
             dynamic_compression: DynamicCompression::Disabled,
+            internal_http: false,
         };
         assert!(PeerCapabilities::local(&options).is_legacy());
+    }
+
+    #[test]
+    fn internal_http_is_advertised_only_when_enabled_and_shared_only_when_both_have_it() {
+        let on = IlmOptions {
+            internal_http: true,
+            ..IlmOptions::LEGACY
+        };
+        let local = PeerCapabilities::local(&on);
+        assert!(local.carries_internal_http());
+        assert!(!local.piggybacks_acks());
+        assert!(!local.is_legacy());
+        assert!(!PeerCapabilities::local(&IlmOptions::LEGACY).carries_internal_http());
+        assert!(!local
+            .intersect(PeerCapabilities::LEGACY)
+            .carries_internal_http());
+        assert!(
+            PeerCapabilities::from_wire(PeerCapabilities::INTERNAL_HTTP, 0).carries_internal_http()
+        );
     }
 
     #[test]

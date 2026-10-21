@@ -26,6 +26,7 @@ const COMPRESSION: DynamicCompression = DynamicCompression::Disabled;
 const EVERYTHING: IlmOptions = IlmOptions {
     piggyback_acks: true,
     dynamic_compression: COMPRESSION,
+    internal_http: false,
 };
 
 type Inbox = citadel_io::tokio::sync::mpsc::UnboundedReceiver<TestMessage>;
