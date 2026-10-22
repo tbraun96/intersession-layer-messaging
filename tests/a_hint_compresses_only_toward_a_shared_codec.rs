@@ -17,6 +17,7 @@ use support::{eventually, Kind, Recorder};
 const EVERYTHING: IlmOptions = IlmOptions {
     piggyback_acks: true,
     dynamic_compression: DynamicCompression::All,
+    internal_http: false,
 };
 
 fn json(n: usize) -> Vec<u8> {
@@ -100,6 +101,7 @@ async fn a_peer_with_a_subset_of_codecs_is_offered_only_that_subset() {
     let deflate_only = IlmOptions {
         piggyback_acks: false,
         dynamic_compression: DynamicCompression::Deflate,
+        internal_http: false,
     };
     let _bob = ILM::new(InMemoryBackend::new(), bob_tx, bob_wire, deflate_only)
         .await
@@ -151,6 +153,7 @@ async fn a_peer_without_brotli_is_offered_zstd_and_a_large_frame_arrives_whole()
     let zstd_only = IlmOptions {
         piggyback_acks: false,
         dynamic_compression: DynamicCompression::Zstd,
+        internal_http: false,
     };
     let _bob = ILM::new(InMemoryBackend::new(), bob_tx, bob_wire, zstd_only)
         .await

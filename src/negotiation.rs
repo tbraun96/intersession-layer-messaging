@@ -58,7 +58,7 @@ impl<M: MessageMetadata> Negotiation<M> {
         }
     }
 
-    fn shared(&self, peer: &M::PeerId) -> PeerCapabilities {
+    pub(crate) fn shared(&self, peer: &M::PeerId) -> PeerCapabilities {
         self.peers
             .get(peer)
             .map(|caps| caps.intersect(self.local))
