@@ -26,7 +26,7 @@ jobs:
       # platform must finish on its own so its measurement gets uploaded.
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        os: [ ubuntu-24.04, macos-latest, windows-latest ]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -45,7 +45,7 @@ jobs:
           if-no-files-found: ignore
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: Avarok-Cybersecurity/gh-actions-deps@master
@@ -56,7 +56,7 @@ jobs:
   # this job the compression module, its bomb guard and every test that
   # negotiates a codec would be green by never having been built.
   codecs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: Avarok-Cybersecurity/gh-actions-deps@master
@@ -76,8 +76,30 @@ jobs:
       - run: cargo build --target wasm32-unknown-unknown --features=compression-brotli,compression-deflate,compression-zstd
 
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: Avarok-Cybersecurity/gh-actions-deps@master
       - run: cargo fmt --check --all
+      - name: Every hosted Linux runner names its release
+        run: sh ci/check-runner-images-are-pinned.sh
+
+  # Branch protection can require ONE name that is true only when every job above succeeded. A job
+  # skipped because of an earlier failure reads as passing to a per-job rule; this one does not.
+  all-checks:
+    name: All checks
+    if: always()
+    needs: [tests, clippy, codecs, fmt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -eu
+          bad=$(printf '%s' "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"')
+          total=$(printf '%s' "$RESULTS" | jq 'length')
+          [ "$total" -gt 0 ] || { echo "::error::needs is empty; this aggregate judged nothing"; exit 1; }
+          [ -z "$bad" ] || { echo "::error::not every job succeeded: $(echo "$bad" | tr '\n' ' ')"; exit 1; }
+          echo "all $total jobs succeeded"
